@@ -1,0 +1,99 @@
+# Save in your fork as .github/workflows/build-apk.yml
+# Run it from the Actions tab ("Run workflow"). Result: artifact "p5r-apk" containing p5r.apk
+#
+# Job 1 (Linux): builds libspirvharness.so in Docker, as in the README. Cached after the first run.
+# Job 2 (Windows): runs the repo's own build_android.cmd -Nce with that library in place.
+
+name: Build P5R APK (NCE)
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_package:
+        description: "Install beside the official app (package io.github.p5rrecomp.nce, label with (NCE))"
+        type: boolean
+        default: true
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore cached shader library
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: private/build/spirv_harness_android/libspirvharness.so
+          key: harness-${{ hashFiles('tools/maxwell/spirv_harness/**', 'games/p5r/tools/build_harness_android.sh') }}
+
+      - name: Fetch Ryubing source
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p private/third_party/ryubing
+          curl -L -o private/third_party/ryubing.tar.gz https://codeberg.org/Software_arch/Ryubing/archive/a82350bb77.tar.gz
+          tar -xzf private/third_party/ryubing.tar.gz -C private/third_party/ryubing --strip-components=1
+
+      - name: Build libspirvharness.so in Docker
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src mcr.microsoft.com/dotnet/sdk:10.0 sh games/p5r/tools/build_harness_android.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libspirvharness
+          path: private/build/spirv_harness_android/libspirvharness.so
+          if-no-files-found: error
+
+  apk:
+    needs: harness
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: libspirvharness
+          path: private/build/spirv_harness_android
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Python venv with cmake and ninja
+        shell: cmd
+        run: |
+          python -m venv private\venv
+          private\venv\Scripts\pip install cmake ninja
+
+      - name: Vulkan headers 1.4.357
+        shell: cmd
+        run: git clone --depth 1 --branch v1.4.357 https://github.com/KhronosGroup/Vulkan-Headers private\third_party\Vulkan-Headers-1.4.357
+
+      - name: Android SDK packages (platform 35, build-tools 35.0.0, NDK 28.2.13676358)
+        shell: bash
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager.bat"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "platforms;android-35" "build-tools;35.0.0" "ndk;28.2.13676358"
+
+      - name: Debug keystore (the APK is signed with it)
+        shell: bash
+        run: |
+          mkdir -p "$USERPROFILE/.android"
+          keytool -genkeypair -keystore "$USERPROFILE/.android/debug.keystore" -storepass android -keypass android -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -validity 10000
+
+      - name: Build APK
+        shell: cmd
+        run: games\p5r\tools\build_android.cmd -Nce ${{ inputs.test_package && '-TestPackage' || '' }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p5r-apk
+          path: private/p5r/apk_nce/p5r.apk
+          if-no-files-found: error
