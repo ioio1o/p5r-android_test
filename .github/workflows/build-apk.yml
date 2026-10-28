@@ -56,6 +56,14 @@ jobs:
           name: libspirvharness
           path: private/build/spirv_harness_android
 
+      - name: Restore cached NCE CMake build
+        uses: actions/cache@v4
+        with:
+          path: private/p5r/ba_nce
+          key: nce-cmake-${{ runner.os }}-ndk28.2.13676358-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            nce-cmake-${{ runner.os }}-ndk28.2.13676358-
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
