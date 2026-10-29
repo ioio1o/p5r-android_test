@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include <nx/game.h>
 #include <nx/runtime.h>
@@ -171,17 +172,31 @@ void boot() {
         nso[i] = nce::load_nso_bytes(it->second, std::string("ExeFS/") + names[i], names[i], base, error);
         if (!nso[i]) fatal("%s", error.c_str());
     }
-    if (const char* want = game::kInfo.main_build_id) {
-        std::string have;
-        for (uint8_t b : nso[0]->build_id) {
-            char hex[3];
-            std::snprintf(hex, sizeof hex, "%02X", b);
-            have += hex;
+    const char* want = game::kInfo.main_build_id;
+    auto build_id_hex = [](const std::vector<uint8_t>& id) {
+        std::string hex;
+        hex.reserve(id.size() * 2);
+        for (uint8_t b : id) {
+            char byte[3];
+            std::snprintf(byte, sizeof byte, "%02X", b);
+            hex += byte;
         }
-        if (have.compare(0, std::strlen(want), want) != 0)
-            fatal("exefs/main is build %s, not %s: this port is made for one version of the game (%s)", have.c_str(), want,
-                  "use the Persona 5 Royal 1.0.2 ExeFS");
+        return hex;
+    };
+    const std::string main_id = build_id_hex(nso[0]->build_id);
+    const bool main_matches = want &&
+        main_id.compare(0, std::strlen(want), want) == 0;
+
+    if (plat::setting("version_log") == "1") {
+        const std::string sdk_id = build_id_hex(nso[1]->build_id);
+        log("version: title_id=%016llX main_build_id=%s expected_main_prefix=%s main_match=%s sdk_build_id=%s",
+            static_cast<unsigned long long>(image->title_id()), main_id.c_str(),
+            want ? want : "(none)", main_matches ? "yes" : "no", sdk_id.c_str());
     }
+
+    if (want && !main_matches)
+        fatal("exefs/main is build %s, not %s: this port is made for one version of the game (%s)",
+              main_id.c_str(), want, "use the Persona 5 Royal 1.0.2 ExeFS");
     g_main = &nso[0]->info, g_sdk = &nso[1]->info;
     const ModuleInfo* mods[] = {g_main, g_sdk};
     const uint8_t* images[] = {nso[0]->image.data(), nso[1]->image.data()};

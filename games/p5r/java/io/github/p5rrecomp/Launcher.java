@@ -93,6 +93,8 @@ public class Launcher extends Activity {
     final Map<String, String> config = new LinkedHashMap<>();
     TextView status;
     Button play;
+    Button versionLogButton;
+    boolean versionLog;
     static final int PICK_ZIP = 1, PICK_FOLDER = 2, PICK_GAME = 3, PICK_KEYS = 4, PICK_ICON = 5, PREPARE = 6;
 
     String t(String spanish, String english) { return Lang.t(spanish, english); }
@@ -386,6 +388,31 @@ public class Launcher extends Activity {
             root.addView(row);
         }
 
+        LinearLayout versionRow = new LinearLayout(this);
+        versionRow.setOrientation(LinearLayout.HORIZONTAL);
+        versionRow.setGravity(Gravity.CENTER_VERTICAL);
+        versionRow.setPadding(0, dp(4), 0, dp(4));
+        TextView versionName = new TextView(this);
+        versionName.setText(t("Diagnóstico de versión", "Game version diagnostics"));
+        versionName.setTextColor(Color.WHITE);
+        versionName.setTextSize(17);
+        versionRow.addView(versionName, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        versionLogButton = new Button(this);
+        versionLogButton.setAllCaps(false);
+        versionLogButton.setMinWidth(dp(180));
+        versionRow.addView(versionLogButton);
+        versionLogButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                versionLog = !versionLog;
+                versionLogButton.setText(versionLog
+                        ? t("Activado", "On") : t("Desactivado", "Off"));
+                save();
+            }
+        });
+        root.addView(versionRow);
+
         LinearLayout edit = new LinearLayout(this);
         edit.setOrientation(LinearLayout.HORIZONTAL);
         edit.setGravity(Gravity.CENTER_VERTICAL);
@@ -502,6 +529,9 @@ public class Launcher extends Activity {
 
     void refresh() {
         load();
+        versionLog = "1".equals(config.get("version_log"));
+        if (versionLogButton != null) versionLogButton.setText(versionLog
+                ? t("Activado", "On") : t("Desactivado", "Off"));
         for (Option o : options) {
             String v = config.get(o.key);
             for (int k = 0; v != null && k < o.values.length; k++)
@@ -695,6 +725,7 @@ public class Launcher extends Activity {
         final String preset = config.get("GRAPHICS");
         if ("low".equals(preset)) config.put("NX_LOD_BIAS", "1");
         else if ("medium".equals(preset)) config.put("NX_LOD_BIAS", "0.5");
+        config.put("version_log", versionLog ? "1" : "0");
         writeConfig(new File(dataDir(), "config.txt"), config);
     }
 
