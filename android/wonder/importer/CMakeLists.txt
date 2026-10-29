@@ -12,3 +12,7 @@ add_executable(nximport_test nximport_test.cpp)
 target_link_libraries(nximport_test nxi)
 enable_testing()
 add_test(NAME nximport_test COMMAND nximport_test)
+
+# Host test of GameImage: opens NSP/XCI in place and reads the RomFS.
+add_executable(nxgame nxgame_cli.cpp)
+target_link_libraries(nxgame nxi)

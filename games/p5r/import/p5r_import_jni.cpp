@@ -24,7 +24,7 @@
 namespace {
 
 constexpr uint64_t kTitle = 0x01005CA01580E000ull;
-constexpr const char* kBuildId = "708BCACA873EA32B";  // 1.0.0, the base game (games/p5r/game.cpp)
+constexpr const char* kBuildId = "D4B150B29A931CD3";  // Persona 5 Royal 1.0.2
 
 std::atomic<int> g_phase{0}, g_done{0}, g_total{0};
 std::mutex g_error_lock;
@@ -90,7 +90,7 @@ int run(int nsp_fd, const std::string& nsp_name, const std::string& keys, const 
     char id[17];
     for (int i = 0; i < 8; i++) std::snprintf(id + 2 * i, 3, "%02X", main_it->second[0x40 + i]);
     if (std::strcmp(id, kBuildId) != 0)
-        return fail(std::string("this is not Persona 5 Royal 1.0.0 (build ") + id + "): use the base game, not the update");
+        return fail(std::string("this is not Persona 5 Royal 1.0.2 (build ") + id + ")");
 
     // 2. the shaders out of the game
     g_phase = 2;

@@ -15,10 +15,11 @@
 
 int main(int argc, char** argv) {
     std::vector<nxi::InputFile> in;
-    std::string compare, read_path;
+    std::string compare, compare_exefs, read_path;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--compare" && i + 1 < argc) { compare = argv[++i]; continue; }
+        if (a == "--compare-exefs" && i + 1 < argc) { compare_exefs = argv[++i]; continue; }
         if (a == "--read" && i + 1 < argc) { read_path = argv[++i]; continue; }
         int fd = open(argv[i], O_RDONLY);
         if (fd < 0) return fprintf(stderr, "cannot open %s\n", argv[i]), 2;
@@ -67,6 +68,34 @@ int main(int argc, char** argv) {
             checked++;
         }
         printf("compared %zu files of %zu: %zu differences\n", checked, all.size(), bad);
+    }
+    if (!compare_exefs.empty()) {
+        size_t checked = 0, bad = 0;
+        for (auto& [n, v] : g->exefs()) {
+            std::string path = compare_exefs + "/" + n;
+            FILE* f = fopen(path.c_str(), "rb");
+            if (!f) {
+                printf("  missing extracted ExeFS file: %s\\n", n.c_str());
+                bad++;
+                continue;
+            }
+            bool same = fseek(f, 0, SEEK_END) == 0;
+            long size = same ? ftell(f) : -1;
+            same = same && size >= 0 && (size_t)size == v.size();
+            if (same && fseek(f, 0, SEEK_SET) == 0) {
+                std::vector<uint8_t> bytes(v.size());
+                same = fread(bytes.data(), 1, bytes.size(), f) == bytes.size()
+                    && memcmp(bytes.data(), v.data(), v.size()) == 0;
+            } else {
+                same = false;
+            }
+            fclose(f);
+            printf("  ExeFS %s: %s (%zu bytes)\\n",
+                   n.c_str(), same ? "MATCH" : "DIFFERS", v.size());
+            checked++;
+            if (!same) bad++;
+        }
+        printf("compared %zu ExeFS files: %zu differences\\n", checked, bad);
     }
     if (!read_path.empty()) {
         const nxi::GameImage::Entry* e = g->find(read_path);

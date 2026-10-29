@@ -154,24 +154,22 @@ void boot() {
     memory_init();
     kernel_init();
 #if NX_NCE
-    // The player's own ExeFS (main and sdk as they are on the cartridge or in the eShop download): from the game file
-    // read in place (game_image.h), else from the data folder's exefs/.
+    // P5R 1.0.2 test: only execute modules from the explicitly selected game image.
+    // Never fall back to a separately extracted ExeFS directory.
     nce::init();
     static std::unique_ptr<nce::NsoModule> nso[2];
-    const std::string exefs = plat::data_root() + "/exefs";
     const char* names[2] = {"main", "sdk"};
     const nxi::GameImage* image = game_image();
+    if (!image)
+        fatal("P5R 1.0.2 test requires a selected game image; refusing extracted ExeFS fallback");
     for (int i = 0; i < 2; i++) {
         std::string error;
         const uint64_t base = kModuleBase + uint64_t(i) * 0x10000000;
-        if (image) {
-            auto it = image->exefs().find(names[i]);
-            if (it == image->exefs().end()) fatal("the game file's ExeFS has no %s", names[i]);
-            nso[i] = nce::load_nso_bytes(it->second, std::string("ExeFS/") + names[i], names[i], base, error);
-        } else {
-            nso[i] = nce::load_nso(exefs + "/" + names[i], names[i], base, error);
-        }
-        if (!nso[i]) fatal("%s (copy the exefs folder of your own dump of the game there)", error.c_str());
+        auto it = image->exefs().find(names[i]);
+        if (it == image->exefs().end())
+            fatal("selected game image's ExeFS has no %s", names[i]);
+        nso[i] = nce::load_nso_bytes(it->second, std::string("ExeFS/") + names[i], names[i], base, error);
+        if (!nso[i]) fatal("%s", error.c_str());
     }
     if (const char* want = game::kInfo.main_build_id) {
         std::string have;
@@ -182,7 +180,7 @@ void boot() {
         }
         if (have.compare(0, std::strlen(want), want) != 0)
             fatal("exefs/main is build %s, not %s: this port is made for one version of the game (%s)", have.c_str(), want,
-                  "copy the exefs of the base game, without the update");
+                  "use the Persona 5 Royal 1.0.2 ExeFS");
     }
     g_main = &nso[0]->info, g_sdk = &nso[1]->info;
     const ModuleInfo* mods[] = {g_main, g_sdk};

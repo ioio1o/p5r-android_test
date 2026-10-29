@@ -647,6 +647,19 @@ Storage* patched_section(Nca& n, int i, Storage* base) {
         in->si.push_back(int32_t(rd32(p + 16)));
     }
     in->size = ti.end;
+    fprintf(stderr, "DBG BKTR %s sec=%d section_size=%llu ind_off=%llu ind_size=%llu ind_count=%d ind_end=%llu ex_off=%llu ex_size=%llu ex_count=%d ex_end=%llu\\n",
+            n.name.c_str(), i, (unsigned long long)s.size,
+            (unsigned long long)ind_off, (unsigned long long)ind_size, ind_count,
+            (unsigned long long)ti.end, (unsigned long long)ex_off,
+            (unsigned long long)ex_size, ex_count, (unsigned long long)te.end);
+    for (size_t e = 0; e < std::min<size_t>(in->v.size(), 8); ++e)
+        fprintf(stderr, "DBG IND[%zu] v=%llu p=%llu storage=%d\\n", e,
+                (unsigned long long)in->v[e], (unsigned long long)in->p[e], in->si[e]);
+    for (size_t e = 0; e < std::min<size_t>(size_t(std::max(ex_count, 0)), 8); ++e) {
+        const uint8_t* p = te.entry(e);
+        fprintf(stderr, "DBG CTR[%zu] off=%llu enc=%u gen=%u\\n", e,
+                (unsigned long long)rd64(p), unsigned(p[8]), rd32(p + 12));
+    }
     if (in->v.empty() || in->v[0] != 0) fail("%s: indirect table does not start at 0", n.name.c_str());
     n.owned.push_back(std::move(in));
     return n.owned.back().get();
@@ -1465,23 +1478,19 @@ int run_import(const std::vector<InputFile>& inputs, const Options& opt, std::st
 struct GameImage::Impl {
     std::vector<std::unique_ptr<Storage>> files;
     std::unique_ptr<Nca> base;
+    std::unique_ptr<Nca> patch;
     uint64_t title = 0;
     std::map<std::string, std::vector<uint8_t>> exefs;
-    // RomFS: section `sec` of `base`, its data level at `level_off` in the section, the file data at `data_off` in it
-    int sec = -1;
+    // Effective RomFS storage: base RomFS or the update's patched view.
+    Storage* romfs_storage = nullptr;
     uint64_t level_off = 0, level_size = 0, data_off = 0;
     std::map<std::string, Entry> entries;                  // every file and folder (folders: dir = true)
     std::map<std::string, std::vector<std::string>> kids;  // folder -> its children's names
 
-    // Bytes of the section's decrypted data at [pos, pos + n): no shared state, so any thread may read.
+    // Read decrypted bytes through the selected base/update storage.
     void read_section(uint64_t pos, void* dst, size_t n) const {
-        const Section& s = base->sec[sec];
-        if (s.crypt() == 1) {
-            base->file->read(s.off + pos, dst, n);
-            return;
-        }
-        std::vector<uint8_t> buf;
-        ctr_read(base->file.get(), s.off + pos, s.off + pos, base->key, s.upper, dst, n, buf);
+        if (!romfs_storage) fail("RomFS storage is not initialised");
+        romfs_storage->read(pos, dst, n);
     }
 };
 
@@ -1586,40 +1595,55 @@ std::unique_ptr<GameImage> GameImage::open(const std::vector<InputFile>& inputs,
         uint64_t app = title_id & ~0xFFFull;
         for (auto& n : programs) {
             if (app && (n->title_id & ~0xFFFull) != app) continue;
-            bool patch = false, sparse = false;
-            for (int i = 0; i < 4; i++)
-                if (n->sec[i].present && n->sec[i].partition() == 0) patch |= n->sec[i].is_patch(), sparse |= n->sec[i].is_sparse();
-            if (patch) continue;  // an update: the base game only
-            if (sparse) fail("%s holds only part of the game (an update-split title): not supported", n->name.c_str());
-            if (im.base) fail("several games in the files given (%s, %s)", tid_str(im.base->title_id).c_str(), tid_str(n->title_id).c_str());
-            im.base = std::move(n);
+            bool is_patch = false, sparse = false;
+            for (int i = 0; i < 4; i++) {
+                if (n->sec[i].present && n->sec[i].partition() == 0) {
+                    is_patch |= n->sec[i].is_patch();
+                    sparse |= n->sec[i].is_sparse();
+                }
+            }
+            if (is_patch) {
+                if (im.patch) fail("several updates found (%s, %s)",
+                                   im.patch->name.c_str(), n->name.c_str());
+                im.patch = std::move(n);
+            } else {
+                if (sparse) fail("%s holds only part of the game (an update-split title): not supported",
+                                 n->name.c_str());
+                if (im.base) fail("several games in the files given (%s, %s)",
+                                  tid_str(im.base->title_id).c_str(), tid_str(n->title_id).c_str());
+                im.base = std::move(n);
+            }
         }
-        if (!im.base) fail(app ? "the files hold no base game of title %s" : "no base game found", tid_str(app).c_str());
+        if (!im.base) fail(app ? "the files hold no base game of title %s" : "no base game found",
+                           tid_str(app).c_str());
+        if (im.patch && (im.patch->title_id & ~0xFFFull) != (im.base->title_id & ~0xFFFull))
+            fail("the update and base game title IDs do not match");
         Nca& b = *im.base;
         if (!b.key_ok) fail("%s: %s", b.name.c_str(), b.key_problem.c_str());
         im.title = b.title_id;
 
         // ExeFS, checked block by block against its hash table (as the import does)
+        Nca* exe_nca = im.patch ? im.patch.get() : &b;
         int exe_sec = -1;
         for (int i = 0; i < 4 && exe_sec < 0; i++)
-            if (b.sec[i].present && b.sec[i].partition() == 1) exe_sec = i;
-        if (exe_sec < 0) fail("%s has no ExeFS", b.name.c_str());
-        Storage* exe = plain_section(b, exe_sec);
-        const uint8_t* efs = b.sec[exe_sec].fs;
+            if (exe_nca->sec[i].present && exe_nca->sec[i].partition() == 1) exe_sec = i;
+        if (exe_sec < 0) fail("%s has no ExeFS", exe_nca->name.c_str());
+        Storage* exe = plain_section(*exe_nca, exe_sec);
+        const uint8_t* efs = exe_nca->sec[exe_sec].fs;
         uint32_t pfs_bs = rd32(efs + 0x28);
         uint64_t ht_off = rd64(efs + 0x30), ht_size = rd64(efs + 0x38), pfs_off = rd64(efs + 0x40), pfs_size = rd64(efs + 0x48);
-        if (!pfs_bs || ht_size > (64u << 20) || pfs_size > (1ull << 31)) fail("%s: implausible ExeFS layout", b.name.c_str());
+        if (!pfs_bs || ht_size > (64u << 20) || pfs_size > (1ull << 31)) fail("%s: implausible ExeFS layout", exe_nca->name.c_str());
         std::vector<uint8_t> ht(ht_size), pfs(pfs_size);
         exe->read(ht_off, ht.data(), ht.size());
         uint8_t d[32];
         sha256(ht.data(), ht.size(), d);
-        if (std::memcmp(d, efs + 0x8, 32) != 0) fail("%s: ExeFS hash table check failed (wrong key?)", b.name.c_str());
+        if (std::memcmp(d, efs + 0x8, 32) != 0) fail("%s: ExeFS hash table check failed (wrong key?)", exe_nca->name.c_str());
         exe->read(pfs_off, pfs.data(), pfs.size());
         for (uint64_t k = 0; k * pfs_bs < pfs_size; k++) {
             size_t m = size_t(std::min<uint64_t>(pfs_bs, pfs_size - k * pfs_bs));
             sha256(pfs.data() + k * pfs_bs, m, d);
             if ((k + 1) * 32 > ht.size() || std::memcmp(d, ht.data() + k * 32, 32) != 0)
-                fail("%s: ExeFS block %llu fails its check", b.name.c_str(), (unsigned long long)k);
+                fail("%s: ExeFS block %llu fails its check", exe_nca->name.c_str(), (unsigned long long)k);
         }
         struct Mem : Storage {
             const std::vector<uint8_t>& v;
@@ -1635,29 +1659,116 @@ std::unique_ptr<GameImage> GameImage::open(const std::vector<InputFile>& inputs,
             mem.read(f.off, out.data(), out.size());
         }
 
-        // RomFS: the IVFC data level, its header and tables (read once; the files are read on demand)
-        for (int i = 0; i < 4 && im.sec < 0; i++)
-            if (b.sec[i].present && b.sec[i].partition() == 0) im.sec = i;
-        if (im.sec < 0) fail("%s has no RomFS", b.name.c_str());
-        if (b.sec[im.sec].crypt() != 1 && b.sec[im.sec].crypt() != 3 && b.sec[im.sec].crypt() != 4)
-            fail("%s: RomFS encryption type %d is not handled", b.name.c_str(), b.sec[im.sec].crypt());
-        const uint8_t* iv = b.sec[im.sec].fs + 0x8;
-        if (rd32(iv) != 0x43465649) fail("%s: RomFS section without an IVFC header", b.name.c_str());
+        // RomFS: use the base section as the lower layer, then apply the update's
+        // indirect/CTR-Ex patch view when the update supplies a patch RomFS.
+        int base_romfs = -1;
+        for (int i = 0; i < 4 && base_romfs < 0; i++)
+            if (b.sec[i].present && b.sec[i].partition() == 0) base_romfs = i;
+        if (base_romfs < 0) fail("%s has no RomFS", b.name.c_str());
+        if (!im.patch && b.sec[base_romfs].is_sparse())
+            fail("the base game holds only part of the game; add its update NSP or XCI");
+
+        Storage* base_sec = b.sec[base_romfs].is_sparse()
+            ? sparse_section(b, base_romfs) : plain_section(b, base_romfs);
+const uint8_t* base_iv = b.sec[base_romfs].fs + 0x8;
+        uint32_t base_levels = rd32(base_iv + 0xC);
+        fprintf(stderr, "DBG BASE-IVFC nca=%s section=%d magic=%08x levels=%u\\n", b.name.c_str(), base_romfs, rd32(base_iv), base_levels);
+        if (rd32(base_iv) == 0x43465649 && base_levels >= 2 && base_levels <= 7) {
+            for (uint32_t l = 0; l < base_levels - 1; ++l) {
+                const uint8_t* lv = base_iv + 0x10 + 0x18 * l;
+                fprintf(stderr, "DBG BASE-LV[%u] off=%llu size=%llu order=%u\\n",
+                    l, (unsigned long long)rd64(lv),
+                    (unsigned long long)rd64(lv + 8), rd32(lv + 16));
+            }
+            const uint8_t* lv = base_iv + 0x10 + 0x18 * (base_levels - 2);
+            uint8_t rh[0x50] = {};
+            base_sec->read(rd64(lv), rh, sizeof rh);
+            fprintf(stderr, "DBG BASE-ROMFS dir_off=%llu dir_size=%llu file_off=%llu file_size=%llu data_off=%llu root_child=%08x root_file=%08x\\n",
+                (unsigned long long)rd64(rh + 0x18),
+                (unsigned long long)rd64(rh + 0x20),
+                (unsigned long long)rd64(rh + 0x38),
+                (unsigned long long)rd64(rh + 0x40),
+                (unsigned long long)rd64(rh + 0x48),
+                rd32(rh + 0x10), rd32(rh + 0x14));
+        }
+
+                im.romfs_storage = base_sec;
+        Nca* romfs_nca = &b;
+        int romfs_sec = base_romfs;
+
+        if (im.patch) {
+            int patch_romfs = -1;
+            for (int i = 0; i < 4 && patch_romfs < 0; i++)
+                if (im.patch->sec[i].present &&
+                    im.patch->sec[i].partition() == 0 &&
+                    im.patch->sec[i].is_patch())
+                    patch_romfs = i;
+            if (patch_romfs < 0)
+                fail("%s has no patch RomFS", im.patch->name.c_str());
+            im.romfs_storage = patched_section(*im.patch, patch_romfs, base_sec);
+            romfs_nca = im.patch.get();
+            romfs_sec = patch_romfs;
+        }
+
+        if (romfs_nca->sec[romfs_sec].crypt() != 1 &&
+            romfs_nca->sec[romfs_sec].crypt() != 3 &&
+            romfs_nca->sec[romfs_sec].crypt() != 4)
+            fail("%s: RomFS encryption type %d is not handled",
+                 romfs_nca->name.c_str(), romfs_nca->sec[romfs_sec].crypt());
+
+        const uint8_t* iv = romfs_nca->sec[romfs_sec].fs + 0x8;
+        if (rd32(iv) != 0x43465649)
+            fail("%s: RomFS section without an IVFC header", romfs_nca->name.c_str());
         uint32_t levels = rd32(iv + 0xC);
-        if (levels < 2 || levels > 7) fail("%s: IVFC with %u levels", b.name.c_str(), levels);
+        if (levels < 2 || levels > 7)
+            fail("%s: IVFC with %u levels", romfs_nca->name.c_str(), levels);
+        fprintf(stderr, "DBG IVFC %s levels=%u master=%s\\n",
+                romfs_nca->name.c_str(), levels, hex(iv + 0xC0, 32).c_str());
+        for (uint32_t l = 0; l < levels - 1; ++l) {
+            const uint8_t* d = iv + 0x10 + 0x18 * l;
+            fprintf(stderr, "DBG IVFC[%u] off=%llu size=%llu order=%u\\n",
+                    l, (unsigned long long)rd64(d),
+                    (unsigned long long)rd64(d + 8), rd32(d + 16));
+        }
         const uint8_t* lv = iv + 0x10 + 0x18 * (levels - 2);
         im.level_off = rd64(lv), im.level_size = rd64(lv + 8);
-        if (im.level_off + im.level_size > b.sec[im.sec].size) fail("%s: RomFS lies outside its section", b.name.c_str());
+        if (im.level_off > im.romfs_storage->size ||
+            im.level_size > im.romfs_storage->size - im.level_off)
+            fail("%s: RomFS lies outside its section", romfs_nca->name.c_str());
         uint8_t rh[0x50];
+        if (im.level_size < sizeof rh)
+            fail("%s: RomFS IVFC data level is too small", romfs_nca->name.c_str());
         im.read_section(im.level_off, rh, sizeof rh);
         uint64_t dir_off = rd64(rh + 0x18), dir_size = rd64(rh + 0x20), file_off = rd64(rh + 0x38), file_size = rd64(rh + 0x40);
         im.data_off = rd64(rh + 0x48);
-        if (rd64(rh) != 0x50 || dir_size > (64u << 20) || file_size > (64u << 20) || dir_off + dir_size > im.level_size ||
-            file_off + file_size > im.level_size)
-            fail("%s: the RomFS header does not decrypt (wrong title key?)", b.name.c_str());
+        if (rd64(rh) != 0x50 || dir_size > (64u << 20) || file_size > (64u << 20) ||
+            dir_off > im.level_size || dir_size > im.level_size - dir_off ||
+            file_off > im.level_size || file_size > im.level_size - file_off ||
+            im.data_off > im.level_size)
+            fail("%s: the RomFS header does not decrypt (wrong title key?)", romfs_nca->name.c_str());
         std::vector<uint8_t> dirs(dir_size), filet(file_size);
         im.read_section(im.level_off + dir_off, dirs.data(), dirs.size());
         im.read_section(im.level_off + file_off, filet.data(), filet.size());
+        fprintf(stderr,
+                "DBG RomFS nca=%s section=%d patch=%d storage_size=%llu level_off=%llu level_size=%llu dir_off=%llu dir_size=%llu file_off=%llu file_size=%llu data_off=%llu root_child=%08x root_file=%08x\\n",
+                romfs_nca->name.c_str(), romfs_sec, im.patch ? 1 : 0,
+                (unsigned long long)im.romfs_storage->size,
+                (unsigned long long)im.level_off, (unsigned long long)im.level_size,
+                (unsigned long long)dir_off, (unsigned long long)dir_size,
+                (unsigned long long)file_off, (unsigned long long)file_size,
+                (unsigned long long)im.data_off,
+                dirs.size() >= 0x18 ? rd32(dirs.data() + 8) : 0xffffffffu,
+                dirs.size() >= 0x18 ? rd32(dirs.data() + 12) : 0xffffffffu);
+        auto dump_table = [](const char* label, const std::vector<uint8_t>& v) {
+            fprintf(stderr, "DBG %s (%zu bytes):", label, v.size());
+            for (size_t i = 0; i < v.size(); ++i) {
+                if (i % 16 == 0) fprintf(stderr, "\n  %04zx:", i);
+                fprintf(stderr, " %02x", unsigned(v[i]));
+            }
+            fprintf(stderr, "\n");
+        };
+        dump_table("DIRS", dirs);
+        dump_table("FILES", filet);
         std::vector<RomfsFile> rf;
         std::vector<std::string> rd;
         walk_romfs(dirs, filet, 0, "", rf, rd, 0);
@@ -1675,7 +1786,9 @@ std::unique_ptr<GameImage> GameImage::open(const std::vector<InputFile>& inputs,
             im.kids[parent_of(dpath)].push_back(name_of(dpath));
         }
         for (const RomfsFile& f : rf) {
-            if (im.data_off + f.off + f.size > im.level_size) fail("RomFS: %s lies outside the image", f.path.c_str());
+            if (f.off > im.level_size - im.data_off ||
+                f.size > im.level_size - im.data_off - f.off)
+                fail("RomFS: %s lies outside the image", f.path.c_str());
             im.entries[f.path] = Entry{f.off, f.size, false};
             im.kids[parent_of(f.path)].push_back(name_of(f.path));
         }

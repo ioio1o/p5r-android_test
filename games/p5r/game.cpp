@@ -1,4 +1,4 @@
-// Persona 5 Royal (01005CA01580E000, 1.0.0, BID 708BCACA873EA32B): what the shared runtime needs to know about the
+// Persona 5 Royal (01005CA01580E000, 1.0.2, BID D4B150B29A931CD3): what the shared runtime needs to know about the
 // game, and what only P5R needs. The game draws through NVN (Atlus' GFD engine); its shaders live in the GFD shader
 // caches BASE/GFDNXHHPRESET*.GSC of ALL_USEU.CPK (tools/gsc_shaders.py). Notes: games/p5r/PROGRESO.md.
 #include <algorithm>
@@ -28,7 +28,7 @@ void linear_write_back_pause(bool paused);  // runtime nvn_draw.cpp: no copies o
 
 const game::Info game::kInfo = {"p5r", "Persona 5 Royal", 0x01005CA01580E000ull, "io.github.p5rrecomp",
                                 "private/p5r", 0 /* main.npdm: no system resource (SDK 13) */,
-                                "708BCACA873EA32B" /* 1.0.0, the base game without the update */};
+                                "D4B150B29A931CD3" /* Persona 5 Royal 1.0.2 */};
 
 namespace {
 

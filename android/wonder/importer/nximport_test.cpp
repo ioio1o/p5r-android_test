@@ -121,9 +121,16 @@ bool has(const std::string& s, const char* t) { return s.find(t) != std::string:
 }  // namespace
 
 int main() {
-    char tpl[] = "/tmp/nximport_test_XXXXXX";
-    if (!mkdtemp(tpl)) return 2;
-    tmpdir = tpl;
+    const char* temp = getenv("TMPDIR");
+    if (!temp || !*temp) temp = "/tmp";
+    std::string pattern = std::string(temp) + "/nximport_test_XXXXXX";
+    std::vector<char> tpl(pattern.begin(), pattern.end());
+    tpl.push_back('\0');
+    if (!mkdtemp(tpl.data())) {
+        perror("mkdtemp");
+        return 2;
+    }
+    tmpdir = tpl.data();
     Bytes junk(0x40, 0xAB);
 
     std::vector<F> parts = {{"update", build({{"upd0.nca", junk}}, true)},

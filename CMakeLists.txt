@@ -65,6 +65,12 @@ endif()
 # Native execution (runtime/src/nce): the game's own AArch64 code from the player's exefs runs on the host CPU, so the
 # build holds no game code at all (Android and other AArch64 hosts). Without it, the recompiled modules are linked in.
 option(NX_NCE "Run the game's own code from the player's exefs natively (AArch64 hosts): no recompiled code" OFF)
+
+# P5R Android test target: require native execution and the exact 1.0.2 main build ID.
+if(ANDROID AND NX_GAME STREQUAL "p5r" AND NOT NX_NCE)
+    message(FATAL_ERROR
+        "P5R Android requires NX_NCE=ON; target main build ID is D4B150B29A931CD3")
+endif()
 if(NX_NCE)
     if(NOT (ANDROID OR CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64"))
         message(FATAL_ERROR "NX_NCE needs an AArch64 host (Android arm64-v8a)")
