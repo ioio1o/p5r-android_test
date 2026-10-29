@@ -156,59 +156,93 @@ NX_HLE("__process_return", process_return);
 static bool load_exefs_mod(const char* module, std::vector<uint8_t>& raw,
                            std::string& source, std::string& error) {
     namespace fs = std::filesystem;
-    const fs::path root = fs::u8path(plat::data_root()) / "mods";
+    const fs::path data = fs::u8path(plat::data_root());
+    constexpr const char* kP5rTitleId = "01005CA01580E000";
+
+    struct ExefsRoot {
+        std::string priority;
+        fs::path path;
+        std::string label;
+    };
+    std::vector<ExefsRoot> roots;
+
+    // Standard SD-card layout is lower priority than named mods.
+    roots.push_back({
+        "",
+        data / "atmosphere" / "contents" / kP5rTitleId / "exefs",
+        "atmosphere/contents"
+    });
+
+    const fs::path mods_dir = data / "mods";
     std::error_code ec;
+    if (fs::is_directory(mods_dir, ec)) {
+        fs::directory_iterator it(mods_dir, ec), end;
+        if (ec) {
+            error = "cannot scan mods directory: " + ec.message();
+            return false;
+        }
 
-    if (!fs::is_directory(root, ec)) {
-        if (ec) error = "cannot inspect mods directory: " + ec.message();
-        return false;
-    }
+        for (; it != end; it.increment(ec)) {
+            if (ec) {
+                error = "error scanning mods directory: " + ec.message();
+                return false;
+            }
 
-    std::vector<std::pair<std::string, fs::path>> mods;
-    fs::directory_iterator it(root, ec), end;
-    if (ec) {
-        error = "cannot scan mods directory: " + ec.message();
-        return false;
-    }
+            std::error_code item_ec;
+            if (!it->is_directory(item_ec)) {
+                if (item_ec) {
+                    error = "cannot inspect mod directory entry: " +
+                            item_ec.message();
+                    return false;
+                }
+                continue;
+            }
 
-    for (; it != end; it.increment(ec)) {
+            auto u8 = it->path().filename().u8string();
+            std::string name(u8.begin(), u8.end());
+            if (name.empty() || name[0] == '.' || name[0] == '_')
+                continue;
+
+            const fs::path mod = it->path();
+
+            // Existing layout takes precedence over a nested Atmosphere
+            // pack within the same named mod.
+            roots.push_back({
+                name + "\n0",
+                mod / "exefs",
+                name
+            });
+            roots.push_back({
+                name + "\n1",
+                mod / "atmosphere" / "contents" /
+                    kP5rTitleId / "exefs",
+                name + "/atmosphere/contents"
+            });
+        }
         if (ec) {
             error = "error scanning mods directory: " + ec.message();
             return false;
         }
-        std::error_code item_ec;
-        if (!it->is_directory(item_ec)) {
-            if (item_ec) {
-                error = "cannot inspect mod directory entry: " + item_ec.message();
-                return false;
-            }
-            continue;
-        }
-        auto u8 = it->path().filename().u8string();
-        std::string name(u8.begin(), u8.end());
-        if (name.empty() || name[0] == '.' || name[0] == '_') continue;
-        mods.emplace_back(std::move(name), it->path());
-    }
-
-    // Also catch an error reported by the final iterator increment.
-    if (ec) {
-        error = "error scanning mods directory: " + ec.message();
+    } else if (ec) {
+        error = "cannot inspect mods directory: " + ec.message();
         return false;
     }
 
-    std::sort(mods.begin(), mods.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::sort(roots.begin(), roots.end(),
+              [](const ExefsRoot& a, const ExefsRoot& b) {
+                  return a.priority < b.priority;
+              });
 
     fs::path chosen;
     std::string chosen_mod;
-    for (const auto& mod : mods) {
-        const fs::path candidate = mod.second / "exefs" / module;
+    for (const auto& root : roots) {
+        const fs::path candidate = root.path / module;
         std::error_code file_ec;
         if (fs::is_regular_file(candidate, file_ec)) {
             chosen = candidate;
-            chosen_mod = mod.first;
+            chosen_mod = root.label;
         } else if (file_ec) {
-            error = "cannot inspect " + mod.first + "/exefs/" + module +
+            error = "cannot inspect " + root.label + "/exefs/" + module +
                     ": " + file_ec.message();
             return false;
         }

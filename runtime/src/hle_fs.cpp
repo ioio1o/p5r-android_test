@@ -160,20 +160,50 @@ const nxi::GameImage::Entry kModDir{0, 0, true};
 
 void scan_mods() {
     g_mod_roots.clear();
-    std::error_code ec;
-    fs::path root = data_root() / "mods";
-    if (!fs::is_directory(root, ec)) return;
+    const fs::path data = data_root();
+    const fs::path mods = data / "mods";
+    constexpr const char* kP5rTitleId = "01005CA01580E000";
     std::vector<fs::path> found;
-    for (auto& e : fs::directory_iterator(root, ec)) {
-        if (!e.is_directory(ec)) continue;
-        auto u8 = e.path().filename().u8string();
-        std::string name(u8.begin(), u8.end());
-        if (name.empty() || name[0] == '.' || name[0] == '_') continue;
-        if (fs::is_directory(e.path() / "romfs", ec)) found.push_back(e.path() / "romfs");
+
+    auto add_romfs = [&](const fs::path& path) {
+        std::error_code ec;
+        if (fs::is_directory(path, ec)) found.push_back(path);
+    };
+
+    // Existing layout: mods/<ModName>/romfs.
+    // Also accept Atmosphere packs nested inside each mod directory.
+    std::error_code ec;
+    if (fs::is_directory(mods, ec)) {
+        fs::directory_iterator it(mods, ec), end;
+        for (; !ec && it != end; it.increment(ec)) {
+            std::error_code item_ec;
+            if (!it->is_directory(item_ec) || item_ec) continue;
+
+            auto u8 = it->path().filename().u8string();
+            std::string name(u8.begin(), u8.end());
+            if (name.empty() || name[0] == '.' || name[0] == '_') continue;
+
+            const fs::path mod = it->path();
+            add_romfs(mod / "romfs");
+            add_romfs(mod / "atmosphere" / "contents" /
+                      kP5rTitleId / "romfs");
+        }
     }
+
+    // Standard SD-card layout: <data folder>/atmosphere/contents/<title ID>/romfs.
+    add_romfs(data / "atmosphere" / "contents" /
+              kP5rTitleId / "romfs");
+
+    // Stable order preserves deterministic overlay precedence.
     std::sort(found.begin(), found.end());
+    found.erase(std::unique(found.begin(), found.end()), found.end());
     g_mod_roots = std::move(found);
-    for (auto& r : g_mod_roots) log("fs: mod active: %s", r.parent_path().filename().string().c_str());
+
+    for (auto& r : g_mod_roots) {
+        auto u8 = r.u8string();
+        std::string path(u8.begin(), u8.end());
+        log("fs: mod active: %s", path.c_str());
+    }
 }
 
 bool safe_rel(const std::string& rel) {  // no ".." part: a mod path never leaves its folder
