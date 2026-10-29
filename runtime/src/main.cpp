@@ -224,8 +224,11 @@ static bool load_exefs_mod(const char* module, std::vector<uint8_t>& raw,
             return false;
         }
     } else if (ec) {
-        error = "cannot inspect mods directory: " + ec.message();
-        return false;
+        const std::string scan_path = mods.string();
+        const std::string scan_error = ec.message();
+        log("warning: cannot inspect mods directory '%s': %s",
+            scan_path.c_str(), scan_error.c_str());
+        ec.clear();
     }
 
     std::sort(roots.begin(), roots.end(),
