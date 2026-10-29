@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -147,6 +148,108 @@ NX_HLE("__rtld_fini", rtld_fini);
 NX_HLE("__rtld_mark", rtld_mark);
 NX_HLE("__process_return", process_return);
 
+
+#if NX_NCE
+// Overlay the highest-priority active mods/<name>/exefs/<module> file.
+// Returns true when an override was loaded, false when none exists.
+// A non-empty error means an override exists but cannot safely be loaded.
+static bool load_exefs_mod(const char* module, std::vector<uint8_t>& raw,
+                           std::string& source, std::string& error) {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::u8path(plat::data_root()) / "mods";
+    std::error_code ec;
+
+    if (!fs::is_directory(root, ec)) {
+        if (ec) error = "cannot inspect mods directory: " + ec.message();
+        return false;
+    }
+
+    std::vector<std::pair<std::string, fs::path>> mods;
+    fs::directory_iterator it(root, ec), end;
+    if (ec) {
+        error = "cannot scan mods directory: " + ec.message();
+        return false;
+    }
+
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            error = "error scanning mods directory: " + ec.message();
+            return false;
+        }
+        std::error_code item_ec;
+        if (!it->is_directory(item_ec)) {
+            if (item_ec) {
+                error = "cannot inspect mod directory entry: " + item_ec.message();
+                return false;
+            }
+            continue;
+        }
+        auto u8 = it->path().filename().u8string();
+        std::string name(u8.begin(), u8.end());
+        if (name.empty() || name[0] == '.' || name[0] == '_') continue;
+        mods.emplace_back(std::move(name), it->path());
+    }
+
+    // Also catch an error reported by the final iterator increment.
+    if (ec) {
+        error = "error scanning mods directory: " + ec.message();
+        return false;
+    }
+
+    std::sort(mods.begin(), mods.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    fs::path chosen;
+    std::string chosen_mod;
+    for (const auto& mod : mods) {
+        const fs::path candidate = mod.second / "exefs" / module;
+        std::error_code file_ec;
+        if (fs::is_regular_file(candidate, file_ec)) {
+            chosen = candidate;
+            chosen_mod = mod.first;
+        } else if (file_ec) {
+            error = "cannot inspect " + mod.first + "/exefs/" + module +
+                    ": " + file_ec.message();
+            return false;
+        }
+    }
+
+    if (chosen.empty()) return false;
+
+    auto u8path = chosen.u8string();
+    source.assign(u8path.begin(), u8path.end());
+
+    FILE* f = plat::fopen_utf8(source, "rb");
+    if (!f) {
+        error = "cannot open ExeFS mod: " + source;
+        return false;
+    }
+
+    constexpr uint64_t kMaxModNsoSize = 512ull * 1024 * 1024;
+    bool ok = false;
+    if (std::fseek(f, 0, SEEK_END) == 0) {
+        const long n = std::ftell(f);
+        if (n > 0 && static_cast<uint64_t>(n) <= kMaxModNsoSize &&
+            std::fseek(f, 0, SEEK_SET) == 0) {
+            std::vector<uint8_t> bytes(static_cast<size_t>(n));
+            if (std::fread(bytes.data(), 1, bytes.size(), f) == bytes.size()) {
+                raw = std::move(bytes);
+                ok = true;
+            }
+        }
+    }
+    std::fclose(f);
+
+    if (!ok) {
+        error = "invalid, oversized, or unreadable ExeFS mod: " + source;
+        return false;
+    }
+
+    log("exefs: mod %s overrides %s", chosen_mod.c_str(), module);
+    return true;
+}
+#endif
+
 // ---- boot -----------------------------------------------------------------------------------------------------
 
 void boot() {
@@ -169,7 +272,15 @@ void boot() {
         auto it = image->exefs().find(names[i]);
         if (it == image->exefs().end())
             fatal("selected game image's ExeFS has no %s", names[i]);
-        nso[i] = nce::load_nso_bytes(it->second, std::string("ExeFS/") + names[i], names[i], base, error);
+
+        // Start with the selected game's original NSO, then overlay a mod in memory.
+        std::vector<uint8_t> raw = it->second;
+        std::string source = std::string("ExeFS/") + names[i];
+        std::string mod_error;
+        if (!load_exefs_mod(names[i], raw, source, mod_error) && !mod_error.empty())
+            fatal("%s", mod_error.c_str());
+
+        nso[i] = nce::load_nso_bytes(raw, source, names[i], base, error);
         if (!nso[i]) fatal("%s", error.c_str());
     }
     const char* want = game::kInfo.main_build_id;
