@@ -789,7 +789,7 @@ uint64_t hook_inline(uint64_t addr, HleFn fn) {
 
     Region& r = it->second;
     const uint64_t from = r.cur;
-    constexpr uint64_t kInlineTrampolineBytes = 6 * sizeof(uint32_t);
+    constexpr uint64_t kInlineTrampolineBytes = 7 * sizeof(uint32_t);
     if (r.failed || r.cur > r.end ||
         r.end - r.cur < kInlineTrampolineBytes) {
         log("nce: inline hook at %llx: insufficient stub region space",
@@ -799,11 +799,12 @@ uint64_t hook_inline(uint64_t addr, HleFn fn) {
 if (!protect(r.base, kRegionSize, PROT_READ | PROT_WRITE | PROT_EXEC))
         protect(r.base, kRegionSize, PROT_READ | PROT_WRITE);
 
-    // The HLE stub returns through x30. The callback sets x30 to the
-    // relocated BL, which then returns here before branching to addr+4.
+    // Set x30 in the stub itself: nce_common restores x30 from its entry
+    // context after nce_dispatch, so callback edits to x30 cannot survive.
     const uint64_t stub = r.emit(kPushX16X17);
     r.emit(movz_w16(index));
     r.emit(movk_w16_hi(0x4000));
+    r.emit(0x1000005Eu);  // adr x30, continuation (S+12 -> S+20)
     r.emit(b_to(r.cur, r.common));
 
     const uint64_t continuation = r.cur;
@@ -828,6 +829,25 @@ if (!protect(r.base, kRegionSize, PROT_READ | PROT_WRITE | PROT_EXEC))
     r.emit(relocated_bl);
     r.emit(b_to(r.cur, addr + 4));
 
+    const uint32_t words[7] = {
+        ld<uint32_t>(stub + 0),  ld<uint32_t>(stub + 4),
+        ld<uint32_t>(stub + 8),  ld<uint32_t>(stub + 12),
+        ld<uint32_t>(stub + 16), ld<uint32_t>(stub + 20),
+        ld<uint32_t>(stub + 24)
+    };
+    auto branch_target = [](uint64_t pc, uint32_t insn) -> uint64_t {
+        int64_t imm = insn & 0x03FFFFFFu;
+        if (imm & (int64_t(1) << 25)) imm -= int64_t(1) << 26;
+        return uint64_t(int64_t(pc) + imm * 4);
+    };
+    log("nce: inline stub %llx words=%08x %08x %08x %08x %08x %08x %08x; "
+        "adr-x30->%llx b->%llx bl->%llx b->%llx",
+        (unsigned long long)stub,
+        words[0], words[1], words[2], words[3], words[4], words[5], words[6],
+        (unsigned long long)(stub + 20),
+        (unsigned long long)branch_target(stub + 16, words[4]),
+        (unsigned long long)branch_target(stub + 20, words[5]),
+        (unsigned long long)branch_target(stub + 24, words[6]));
 
     g_hooks[index] = fn;
     g_hook_count.store(index + 1);

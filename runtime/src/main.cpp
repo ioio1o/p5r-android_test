@@ -510,8 +510,8 @@ static void skyline_inline_hook_callback(CPU& c) {
     }
 
     if (g_skyline_hook_mode != SkylineHookMode::Full) {
-        // The trampoline resumes at the relocated original BL.
-        c.x[30] = continuation;
+        // The trampoline's ADR instruction already set the saved x30 to the
+        // relocated BL continuation before entering nce_common.
         if (emit)
             log("skyline: inline callback event=%llu total=%llu "
                 "passthrough; resume relocated BL=%llx",
@@ -522,7 +522,6 @@ static void skyline_inline_hook_callback(CPU& c) {
     }
 
     if (!replacement) {
-        c.x[30] = continuation;
         if (emit)
             log("skyline: inline callback event=%llu total=%llu "
                 "missing replacement; passthrough resume=%llx",
@@ -532,22 +531,28 @@ static void skyline_inline_hook_callback(CPU& c) {
         return;
     }
 
-    // InlineCtx is a host-stack object whose lifetime spans nce::enter().
-    // It is intentionally not checked with guest_range_ok/vm_query.
-    alignas(16) uint64_t inline_context[31]{};
-    constexpr size_t context_size = sizeof(inline_context);
+    // Keep InlineCtx in guest memory below the interrupted guest SP.
+    // Do not use vm_query: this stack mapping is not described by that API.
+    constexpr size_t context_size = sizeof(uint64_t) * 31;
+    if (c.x[31] < context_size) {
+        if (emit)
+            log("skyline: inline callback has invalid guest SP=%llx",
+                (unsigned long long)c.x[31]);
+        return;
+    }
+    const uint64_t inline_context_address =
+        (c.x[31] - context_size) & ~uint64_t(0xF);
+    auto* inline_context =
+        reinterpret_cast<uint64_t*>(inline_context_address);
     std::memcpy(inline_context, c.x, context_size);
 
     CPU plugin_call = c;
-    plugin_call.x[0] =
-        reinterpret_cast<uint64_t>(inline_context);
+    plugin_call.x[0] = inline_context_address;
+    plugin_call.x[31] = inline_context_address;
 
     nce::enter(plugin_call, replacement);
 
     std::memcpy(c.x, inline_context, context_size);
-
-    // Return to the relocated BL, which then branches to original addr+4.
-    c.x[30] = continuation;
 
     if (emit)
         log("skyline: inline callback event=%llu total=%llu "
