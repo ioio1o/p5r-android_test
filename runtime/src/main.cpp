@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "game_image.h"
 #include "nce/nce.h"
 #include "nce/nso.h"
+#include "nce/nro.h"
 #else
 extern const nx::ModuleInfo nx_module_main;
 extern const nx::ModuleInfo nx_module_sdk;
@@ -148,6 +150,210 @@ NX_HLE("__rtld_fini", rtld_fini);
 NX_HLE("__rtld_mark", rtld_mark);
 NX_HLE("__process_return", process_return);
 
+
+#if NX_NCE
+namespace {
+
+template <typename T>
+bool nro_read(const std::vector<uint8_t>& image, uint64_t offset, T& value) {
+    if (offset > image.size() || sizeof(T) > image.size() - offset)
+        return false;
+    std::memcpy(&value, image.data() + offset, sizeof(T));
+    return true;
+}
+
+struct NroDynamicSymbol {
+    uint32_t name;
+    uint8_t info;
+    uint8_t other;
+    uint16_t section;
+    uint64_t value;
+    uint64_t size;
+};
+static_assert(sizeof(NroDynamicSymbol) == 24);
+
+static bool module_exports(const ModuleInfo* module, const char* name) {
+    if (!module || !name || !*name)
+        return false;
+
+    for (size_t i = 0; i < module->symbol_count; ++i) {
+        const Symbol& symbol = module->symbols[i];
+        if (!symbol.imported && symbol.bind != 0 && symbol.name &&
+            std::strcmp(symbol.name, name) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void inspect_skyline_nro(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        log("skyline: cannot open %s", path.string().c_str());
+        return;
+    }
+
+    const std::streamoff length = file.tellg();
+    if (length <= 0 || uint64_t(length) > SIZE_MAX) {
+        log("skyline: invalid file size: %s", path.string().c_str());
+        return;
+    }
+
+    std::vector<uint8_t> raw(static_cast<size_t>(length));
+    file.seekg(0, std::ios::beg);
+    file.read(reinterpret_cast<char*>(raw.data()), length);
+    if (!file || file.gcount() != length) {
+        log("skyline: incomplete read: %s", path.string().c_str());
+        return;
+    }
+
+    std::string error;
+    auto nro = nce::parse_nro_bytes(raw, path.string(), error);
+    if (!nro) {
+        log("skyline: invalid NRO: %s", error.c_str());
+        return;
+    }
+
+    const auto& image = nro->image;
+
+    // MOD0 + 4 contains a signed offset to the dynamic table.
+    int32_t dynamic_relative = 0;
+    if (!nro_read(image, uint64_t(nro->mod0_offset) + 4, dynamic_relative)) {
+        log("skyline: %s: cannot read MOD0 dynamic offset", path.filename().string().c_str());
+        return;
+    }
+
+    const int64_t dynamic_signed =
+        int64_t(nro->mod0_offset) + int64_t(dynamic_relative);
+    if (dynamic_signed < 0 || uint64_t(dynamic_signed) >= image.size()) {
+        log("skyline: %s: dynamic table is outside image", path.filename().string().c_str());
+        return;
+    }
+
+    constexpr int64_t DT_NULL = 0;
+    constexpr int64_t DT_HASH = 4;
+    constexpr int64_t DT_STRTAB = 5;
+    constexpr int64_t DT_SYMTAB = 6;
+    constexpr int64_t DT_STRSZ = 10;
+    constexpr int64_t DT_SYMENT = 11;
+
+    uint64_t hash = 0, strtab = 0, symtab = 0, strsz = 0, syment = 0;
+    bool terminated = false;
+
+    // Elf64_Dyn entries are 16 bytes. Bound the scan even if the file is malformed.
+    for (size_t i = 0; i < 4096; ++i) {
+        const uint64_t at = uint64_t(dynamic_signed) + uint64_t(i) * 16;
+        int64_t tag = 0;
+        uint64_t value = 0;
+
+        if (!nro_read(image, at, tag) || !nro_read(image, at + 8, value))
+            break;
+
+        if (tag == DT_NULL) {
+            terminated = true;
+            break;
+        }
+
+        switch (tag) {
+            case DT_HASH:   hash = value; break;
+            case DT_STRTAB: strtab = value; break;
+            case DT_SYMTAB: symtab = value; break;
+            case DT_STRSZ:  strsz = value; break;
+            case DT_SYMENT: syment = value; break;
+            default: break;
+        }
+    }
+
+    const char* plugin_name = path.filename().string().c_str();
+    if (!terminated || !hash || !strtab || !symtab || !strsz ||
+        syment != sizeof(NroDynamicSymbol)) {
+        log("skyline: %s: missing or invalid dynamic symbol metadata", plugin_name);
+        return;
+    }
+
+    uint32_t bucket_count = 0, symbol_count = 0;
+    if (!nro_read(image, hash, bucket_count) ||
+        !nro_read(image, hash + 4, symbol_count) ||
+        symbol_count == 0 ||
+        symbol_count > image.size() / sizeof(NroDynamicSymbol) ||
+        symtab > image.size() ||
+        uint64_t(symbol_count) > (image.size() - symtab) / sizeof(NroDynamicSymbol) ||
+        strtab > image.size() || strsz > image.size() - strtab) {
+        log("skyline: %s: invalid hash, symbol, or string table bounds", plugin_name);
+        return;
+    }
+    (void)bucket_count;
+
+    std::vector<std::string> names(symbol_count);
+    std::vector<uint16_t> sections(symbol_count);
+
+    for (uint32_t i = 0; i < symbol_count; ++i) {
+        NroDynamicSymbol symbol{};
+        const uint64_t at = symtab + uint64_t(i) * sizeof(symbol);
+
+        if (!nro_read(image, at, symbol)) {
+            log("skyline: %s: truncated dynamic symbol table", plugin_name);
+            return;
+        }
+
+        sections[i] = symbol.section;
+
+        if (symbol.name >= strsz)
+            continue;
+
+        const char* start = reinterpret_cast<const char*>(image.data() + strtab + symbol.name);
+        const size_t remaining = static_cast<size_t>(strsz - symbol.name);
+        const void* end = std::memchr(start, '\0', remaining);
+        if (!end) {
+            log("skyline: %s: unterminated symbol name at index %u", plugin_name, i);
+            return;
+        }
+
+        names[i].assign(start, static_cast<const char*>(end) - start);
+    }
+
+    size_t imports = 0, local = 0, hle = 0, game = 0, unresolved = 0;
+
+    for (uint32_t i = 1; i < symbol_count; ++i) {
+        // SHN_UNDEF means this dynamic symbol is imported.
+        if (sections[i] != 0 || names[i].empty())
+            continue;
+
+        ++imports;
+        const char* name = names[i].c_str();
+        const char* source = "UNRESOLVED";
+
+        // Resolution priority: plugin-defined symbol, HLE, then main/SDK.
+        bool found_local = false;
+        for (uint32_t j = 1; j < symbol_count; ++j) {
+            if (sections[j] != 0 && names[j] == names[i]) {
+                found_local = true;
+                break;
+            }
+        }
+
+        if (found_local) {
+            source = "PLUGIN";
+            ++local;
+        } else if (hle_lookup(name)) {
+            source = "HLE";
+            ++hle;
+        } else if (module_exports(g_main, name) || module_exports(g_sdk, name)) {
+            source = "MAIN/SDK";
+            ++game;
+        } else {
+            ++unresolved;
+        }
+
+        log("skyline: import[%u] %s -> %s", i, name, source);
+    }
+
+    log("skyline: %s dry-run: %zu imports; plugin=%zu HLE=%zu main/sdk=%zu unresolved=%zu",
+        plugin_name, imports, local, hle, game, unresolved);
+}
+
+}  // namespace
+#endif
+
 // ---- boot -----------------------------------------------------------------------------------------------------
 
 void boot() {
@@ -201,113 +407,54 @@ void boot() {
     g_main = &nso[0]->info;
     g_sdk = &nso[1]->info;
 
-    // Find the winning mod using the same alphabetical priority as the
-    // existing ROMFS overlay: sorted ascending, last matching mod wins.
+    // Read-only Skyline plugin import inspection. Plugins are not loaded or executed.
     namespace fs = std::filesystem;
-    fs::path selected_subsdk9;
-    std::vector<fs::path> mod_dirs;
     const fs::path mods_root = fs::u8path(plat::data_root()) / "mods";
+    std::vector<fs::path> plugin_paths;
     std::error_code ec;
-    if (fs::is_directory(mods_root, ec)) {
-        for (fs::directory_iterator it(mods_root, ec), end; !ec && it != end; it.increment(ec)) {
+
+    if (fs::is_directory(mods_root, ec) && !ec) {
+        for (fs::directory_iterator it(mods_root, ec), finish;
+             !ec && it != finish; it.increment(ec)) {
             std::error_code entry_ec;
-            if (!it->is_directory(entry_ec) || entry_ec) continue;
+            if (!it->is_directory(entry_ec) || entry_ec)
+                continue;
 
             const std::string folder = it->path().filename().string();
-            if (folder.empty() || folder[0] == '.' || folder[0] == '_') continue;
+            if (folder.empty() || folder[0] == '.' || folder[0] == '_')
+                continue;
 
-            std::error_code romfs_ec, subsdk_ec;
-            const bool has_romfs = fs::is_directory(it->path() / "romfs", romfs_ec);
-            const bool has_subsdk9 = fs::is_regular_file(
-                it->path() / "exefs" / "subsdk9", subsdk_ec);
+            const fs::path plugins_dir =
+                it->path() / "romfs" / "skyline" / "plugins";
+            std::error_code plugins_ec;
+            if (!fs::is_directory(plugins_dir, plugins_ec) || plugins_ec)
+                continue;
 
-            if (has_romfs && !romfs_ec && has_subsdk9 && !subsdk_ec)
-                mod_dirs.push_back(it->path());
-        }
-    }
-    std::sort(mod_dirs.begin(), mod_dirs.end());
-    if (!mod_dirs.empty())
-        selected_subsdk9 = mod_dirs.back() / "exefs" / "subsdk9";
+            for (fs::directory_iterator plugin_it(plugins_dir, plugins_ec), plugin_end;
+                 !plugins_ec && plugin_it != plugin_end;
+                 plugin_it.increment(plugins_ec)) {
+                std::error_code file_ec;
+                if (!plugin_it->is_regular_file(file_ec) || file_ec)
+                    continue;
 
-    size_t module_count = 2;
-    const ModuleInfo* mods[3] = {g_main, g_sdk, nullptr};
-    const uint8_t* images[3] = {
-        nso[0]->image.data(), nso[1]->image.data(), nullptr
-    };
-    size_t optional_index = static_cast<size_t>(-1);
-
-    if (!selected_subsdk9.empty()) {
-        if (!main_matches) {
-            log("exefs: optional subsdk9 skipped: main version mismatch");
-        } else if (!plat::reserve(0x4020000000ull, 0x10000000ull)) {
-            log("exefs: optional subsdk9 skipped: cannot reserve 256 MiB slot");
-        } else {
-            std::string error;
-            nso[2] = nce::load_nso(selected_subsdk9.string(), "subsdk9",
-                                   0x4020000000ull, error);
-            if (!nso[2]) {
-                log("exefs: optional subsdk9 skipped: %s", error.c_str());
-            } else {
-                const auto& mi = nso[2]->info;
-                log("exefs: optional subsdk9 candidate: %s", selected_subsdk9.string().c_str());
-                log("exefs: subsdk9 MOD0=%#x DT_INIT=%#llx DT_INIT_ARRAY=%#llx size=%#llx entries=%zu",
-                    nso[2]->mod0_offset,
-                    (unsigned long long)nso[2]->dt_init,
-                    (unsigned long long)nso[2]->dt_init_array,
-                    (unsigned long long)nso[2]->dt_init_array_size,
-                    nso[2]->init_array.size());
-
-                size_t collisions = 0;
-                for (size_t k = 0; k < mi.symbol_count; k++) {
-                    const Symbol& sym = mi.symbols[k];
-                    if (sym.imported || !sym.name[0] || sym.bind == 0) continue;
-                    bool collision = false;
-                    for (size_t j = 0; j < g_main->symbol_count; j++) {
-                        const Symbol& other = g_main->symbols[j];
-                        if (!other.imported && other.bind != 0 &&
-                            std::strcmp(sym.name, other.name) == 0) {
-                            collision = true;
-                            break;
-                        }
-                    }
-                    if (!collision) {
-                        for (size_t j = 0; j < g_sdk->symbol_count; j++) {
-                            const Symbol& other = g_sdk->symbols[j];
-                            if (!other.imported && other.bind != 0 &&
-                                std::strcmp(sym.name, other.name) == 0) {
-                                collision = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (collision) ++collisions;
-                }
-                log("exefs: subsdk9 exported names colliding with main/sdk: %zu", collisions);
-
-                char first_words[16 * 9 + 1] = {};
-                size_t used = 0;
-                const size_t text_at = size_t(mi.text);
-                for (size_t k = 0; k < 16 && text_at + k * 4 + 4 <= nso[2]->image.size(); k++) {
-                    uint32_t word = 0;
-                    std::memcpy(&word, nso[2]->image.data() + text_at + k * 4, 4);
-                    int n = std::snprintf(first_words + used, sizeof(first_words) - used,
-                                          "%s%08X", k ? " " : "", word);
-                    if (n <= 0 || size_t(n) >= sizeof(first_words) - used) break;
-                    used += size_t(n);
-                }
-                log("exefs: subsdk9 first text words: %s", first_words);
-
-                mods[1] = &nso[2]->info;
-                images[1] = nso[2]->image.data();
-                mods[2] = g_sdk;
-                images[2] = nso[1]->image.data();
-                module_count = 3;
-                optional_index = 1;
+                if (plugin_it->path().extension() == ".nro")
+                    plugin_paths.push_back(plugin_it->path());
             }
         }
     }
 
-    load_modules(mods, module_count, "", images, optional_index);
+    std::sort(plugin_paths.begin(), plugin_paths.end());
+    log("skyline: discovered %zu plugin NRO file(s)", plugin_paths.size());
+
+    for (const fs::path& plugin_path : plugin_paths)
+        inspect_skyline_nro(plugin_path);
+
+    // This boot batch intentionally contains only the game's main and SDK modules.
+    const ModuleInfo* mods[] = {g_main, g_sdk};
+    const uint8_t* images[] = {
+        nso[0]->image.data(), nso[1]->image.data()
+    };
+    load_modules(mods, 2, "", images, static_cast<size_t>(-1));
 #else
     g_main = &nx_module_main, g_sdk = &nx_module_sdk;
     const ModuleInfo* mods[] = {g_main, g_sdk};
