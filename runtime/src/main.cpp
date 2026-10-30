@@ -570,13 +570,160 @@ static bool load_skyline_nro(const std::filesystem::path& path) {
     plugin->info.symbols = plugin->symbols.data();
     plugin->info.symbol_count = plugin->symbols.size();
 
+    // Resolve imports after main and SDK have been linked.
+    // Priority: plugin definitions, HLE, main, SDK.
+    enum : uint8_t {
+        kImportUnresolved = 0,
+        kImportPlugin = 1,
+        kImportHle = 2,
+        kImportMain = 3,
+        kImportSdk = 4
+    };
+
+    std::vector<uint64_t> resolved_symbols(symbol_count, 0);
+
+    size_t imports_plugin = 0;
+    size_t imports_hle = 0;
+    size_t imports_main = 0;
+    size_t imports_sdk = 0;
+    size_t imports_unresolved = 0;
+
+    for (uint32_t i = 0; i < symbol_count; ++i) {
+        const Symbol& sym = plugin->symbols[i];
+        if (!sym.imported)
+            continue;
+
+        const char* name = plugin->names[i].c_str();
+        uint64_t target = 0;
+        uint8_t source = kImportUnresolved;
+
+        // First: a definition inside this plugin.
+        if (name[0]) {
+            for (uint32_t j = 1; j < symbol_count; ++j) {
+                const Symbol& local = plugin->symbols[j];
+                if (!local.imported && local.bind != 0 &&
+                    plugin->names[j] == name) {
+                    target = base + local.value;
+                    source = kImportPlugin;
+                    break;
+                }
+            }
+        }
+
+        // __nro_header_start denotes the beginning of this NRO.
+        if (!target && name[0] &&
+            std::strcmp(name, "__nro_header_start") == 0) {
+            target = base;
+            source = kImportPlugin;
+            log("skyline: %s __nro_header_start -> plugin base %llx",
+                plugin->name.c_str(), (unsigned long long)base);
+        }
+
+        // Then registered HLE handlers.
+        if (!target && name[0] && hle_lookup(name)) {
+            target = hle_address(name);
+            source = kImportHle;
+        }
+
+        // Then main, followed by SDK exports.
+        if (!target && name[0]) {
+            target = skyline_module_symbol(g_main, name);
+            if (target)
+                source = kImportMain;
+        }
+
+        if (!target && name[0]) {
+            target = skyline_module_symbol(g_sdk, name);
+            if (target)
+                source = kImportSdk;
+        }
+
+        // An unresolved weak symbol is valid and resolves to zero.
+        // For unresolved strong symbols, use the loader's missing-import
+        // HLE stub so a later call is logged instead of jumping to zero.
+        if (!target && name[0] && sym.bind != 2) {
+            target = hle_address(name);
+            source = kImportUnresolved;
+        }
+
+        resolved_symbols[i] = target;
+
+        switch (source) {
+        case kImportPlugin: ++imports_plugin; break;
+        case kImportHle: ++imports_hle; break;
+        case kImportMain: ++imports_main; break;
+        case kImportSdk: ++imports_sdk; break;
+        default:
+            ++imports_unresolved;
+            log("skyline: %s unresolved import[%u] %s%s",
+                plugin->name.c_str(), i, name,
+                sym.bind == 2 ? " (weak; resolved to zero)" : "");
+            break;
+        }
+    }
+
+    size_t applied_relative = 0;
+    size_t applied_glob_dat = 0;
+    size_t applied_jump_slot = 0;
+    size_t applied_abs64 = 0;
+    size_t targets_text = 0;
+    size_t targets_ro = 0;
+    size_t targets_data = 0;
+    size_t targets_bss = 0;
+    size_t targets_outside = 0;
+
     bool relocation_ok = true;
+
     for (const Reloc& r : plugin->relocs) {
         if (r.type == 0)
             continue;
 
         if (r.offset > mapped_size ||
             sizeof(uint64_t) > mapped_size - r.offset) {
+            ++targets_outside;
+            log("skyline: %s relocation target outside mapped image: %llx",
+                plugin->name.c_str(), (unsigned long long)r.offset);
+            relocation_ok = false;
+            break;
+        }
+
+        // Classify the complete 8-byte relocation write.
+        enum class TargetSegment { Text, Ro, Data, Bss, Outside };
+        auto contains_write = [&](uint64_t begin, uint64_t size) {
+            return size && r.offset >= begin &&
+                r.offset - begin <= size &&
+                sizeof(uint64_t) <= size - (r.offset - begin);
+        };
+
+        TargetSegment segment = TargetSegment::Outside;
+        if (contains_write(plugin->nro->text, plugin->nro->text_size))
+            segment = TargetSegment::Text;
+        else if (contains_write(plugin->nro->ro, plugin->nro->ro_size))
+            segment = TargetSegment::Ro;
+        else if (contains_write(plugin->nro->data, plugin->nro->data_size))
+            segment = TargetSegment::Data;
+        else if (contains_write(
+                     plugin->nro->data + plugin->nro->data_size,
+                     plugin->nro->bss_size))
+            segment = TargetSegment::Bss;
+
+        switch (segment) {
+        case TargetSegment::Text: ++targets_text; break;
+        case TargetSegment::Ro: ++targets_ro; break;
+        case TargetSegment::Data: ++targets_data; break;
+        case TargetSegment::Bss: ++targets_bss; break;
+        default: ++targets_outside; break;
+        }
+
+        // Text is executable and must not receive relocation writes.
+        // RO remains host-writable until the plugin's mapping is finalized.
+        if (segment == TargetSegment::Text ||
+            segment == TargetSegment::Outside) {
+            log("skyline: %s rejected relocation target %llx "
+                "(segment=%s)",
+                plugin->name.c_str(),
+                (unsigned long long)r.offset,
+                segment == TargetSegment::Text ? "text" : "outside");
             relocation_ok = false;
             break;
         }
@@ -588,42 +735,28 @@ static bool load_skyline_nro(const std::filesystem::path& path) {
                    r.type == R_AARCH64_GLOB_DAT ||
                    r.type == R_AARCH64_JUMP_SLOT) {
             if (r.sym >= symbol_count) {
+                log("skyline: %s relocation has invalid symbol index %u",
+                    plugin->name.c_str(), r.sym);
                 relocation_ok = false;
                 break;
             }
 
             const Symbol& sym = plugin->symbols[r.sym];
-            const char* name = plugin->names[r.sym].c_str();
+            target = sym.imported
+                ? resolved_symbols[r.sym]
+                : base + sym.value;
 
-            if (!sym.imported) {
-                target = base + sym.value;
-            } else if (name[0] &&
-                       std::strcmp(name, "__nro_header_start") == 0) {
-                target = base;
-            } else if (name[0]) {
-                for (uint32_t j = 1; j < symbol_count && !target; ++j) {
-                    const Symbol& local = plugin->symbols[j];
-                    if (!local.imported && local.bind != 0 &&
-                        plugin->names[j] == name)
-                        target = base + local.value;
-                }
-                if (!target && hle_lookup(name))
-                    target = hle_address(name);
-                if (!target)
-                    target = skyline_module_symbol(g_main, name);
-                if (!target)
-                    target = skyline_module_symbol(g_sdk, name);
-            }
-
-            if (!target) {
-                log("skyline: %s unresolved relocation symbol %s",
-                    plugin_name.c_str(), name);
+            // Zero is valid for an unresolved weak import.
+            if (!target && !(sym.imported && sym.bind == 2)) {
+                log("skyline: %s relocation has unresolved symbol %s",
+                    plugin->name.c_str(),
+                    plugin->names[r.sym].c_str());
                 relocation_ok = false;
                 break;
             }
         } else {
             log("skyline: %s unsupported relocation type %u",
-                plugin_name.c_str(), r.type);
+                plugin->name.c_str(), r.type);
             relocation_ok = false;
             break;
         }
@@ -631,7 +764,26 @@ static bool load_skyline_nro(const std::filesystem::path& path) {
         const uint64_t value = target + uint64_t(r.addend);
         std::memcpy(reinterpret_cast<void*>(base + r.offset),
                     &value, sizeof(value));
+
+        switch (r.type) {
+        case R_AARCH64_RELATIVE: ++applied_relative; break;
+        case R_AARCH64_GLOB_DAT: ++applied_glob_dat; break;
+        case R_AARCH64_JUMP_SLOT: ++applied_jump_slot; break;
+        case R_AARCH64_ABS64: ++applied_abs64; break;
+        }
     }
+
+    log("skyline: %s imports: plugin=%zu HLE=%zu main=%zu SDK=%zu "
+        "unresolved=%zu",
+        plugin->name.c_str(), imports_plugin, imports_hle,
+        imports_main, imports_sdk, imports_unresolved);
+
+    log("skyline: %s relocations applied: RELATIVE=%zu GLOB_DAT=%zu "
+        "JUMP_SLOT=%zu ABS64=%zu; targets text=%zu ro=%zu data=%zu "
+        "bss=%zu outside=%zu",
+        plugin->name.c_str(), applied_relative, applied_glob_dat,
+        applied_jump_slot, applied_abs64, targets_text, targets_ro,
+        targets_data, targets_bss, targets_outside);
 
     if (!relocation_ok) {
         decommit(base, mapped_size);
@@ -769,15 +921,17 @@ void boot() {
     std::sort(plugin_paths.begin(), plugin_paths.end());
     log("skyline: discovered %zu plugin NRO file(s)", plugin_paths.size());
 
-    for (const fs::path& plugin_path : plugin_paths)
-        inspect_skyline_nro(plugin_path);
-
     // This boot batch intentionally contains only the game's main and SDK modules.
     const ModuleInfo* mods[] = {g_main, g_sdk};
     const uint8_t* images[] = {
         nso[0]->image.data(), nso[1]->image.data()
     };
     load_modules(mods, 2, "", images, static_cast<size_t>(-1));
+
+    // Main/SDK exports are now linked. Relocate and NCE-prepare plugins,
+    // but do not execute constructors or entry points.
+    for (const fs::path& plugin_path : plugin_paths)
+        inspect_skyline_nro(plugin_path);
 #else
     g_main = &nx_module_main, g_sdk = &nx_module_sdk;
     const ModuleInfo* mods[] = {g_main, g_sdk};

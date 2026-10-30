@@ -569,6 +569,8 @@ void init() {
     if (!protect(kThunkBase, kThunkSize + kThunkExtra, PROT_READ | PROT_EXEC))
         fatal("nce: this system does not let the app run code it loaded (mprotect PROT_EXEC failed)");
     clear_cache(kThunkBase, kThunkSize + kThunkExtra);
+    log("nce: native execution ready, counter frequency=%llu Hz",
+        (unsigned long long)freq);
 }
 
 static bool prepare_module_impl(const LoadedModule& m, bool optional) {
