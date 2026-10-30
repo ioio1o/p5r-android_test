@@ -31,6 +31,7 @@ void init();
 
 // After a module is copied and relocated (loader.cpp): its svc/mrs/msr sites patched, its text made executable.
 void prepare_module(const LoadedModule& m);
+bool prepare_module_optional(const LoadedModule& m);
 
 // Runs guest code at `target` on context c until it returns (call(), for every address outside the thunks).
 void enter(CPU& c, uint64_t target);

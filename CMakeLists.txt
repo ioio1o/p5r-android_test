@@ -206,7 +206,7 @@ if(WIN32)  # its POSIX calls, on Windows (only these two files see the shim)
         COMPILE_DEFINITIONS "_CRT_NONSTDC_NO_WARNINGS")
 endif()
 if(NX_NCE)
-    list(APPEND NX_RUNTIME_SOURCES runtime/src/nce/nce.cpp runtime/src/nce/nso.cpp)
+    list(APPEND NX_RUNTIME_SOURCES runtime/src/nce/nce.cpp runtime/src/nce/nso.cpp runtime/src/nce/nro.cpp)
 endif()
 
 # Vulkan headers (the same registry version tools/gen_vk.py generated from). The loader comes with the GPU driver.

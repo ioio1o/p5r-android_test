@@ -91,7 +91,8 @@ struct LoadedModule {
 
 // Module images from data_dir/<name>.bin, or from `images` (native execution: the NSOs of the player's exefs).
 void load_modules(const ModuleInfo* const* mods, size_t count, const std::string& data_dir,
-                  const uint8_t* const* images = nullptr);
+                  const uint8_t* const* images = nullptr,
+                  size_t optional_index = static_cast<size_t>(-1));
 uint64_t find_symbol(const char* name);  // 0 when not found
 const LoadedModule* module_at(uint64_t addr);
 std::string describe(uint64_t addr);  // "sdk+0x1234 (symbol+0x10)"

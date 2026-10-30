@@ -421,28 +421,43 @@ bool pc_relative(uint32_t w) {
 
 struct Region {
     uint64_t base = 0, cur = 0, end = 0;
-    uint64_t common = 0, ret = 0;  // this region's copy of nce_common / nce_return
+    uint64_t common = 0, ret = 0;
+    bool safe = false, failed = false;
 
     uint64_t emit(uint32_t w) {
-        if (cur + 4 > end) fatal("nce: stub region at %llx is full", (unsigned long long)base);
+        if (failed) return base;
+        if (cur > end || end - cur < 4) {
+            if (!safe) fatal("nce: stub region at %llx is full", (unsigned long long)base);
+            failed = true;
+            cur = base;
+            return base;
+        }
         st<uint32_t>(cur, w);
         cur += 4;
         return cur - 4;
     }
     uint64_t emit64(uint64_t v) {
-        while (cur & 7) emit(kNop);
-        const uint64_t a = cur;
+        while (!failed && (cur & 7)) emit(kNop);
+        const uint64_t a = failed ? base : cur;
         emit(uint32_t(v));
         emit(uint32_t(v >> 32));
         return a;
     }
-    void copy_common() {
+    bool copy_common() {
+        if (failed) return false;
         const size_t n = size_t(nce_region_end - nce_region_start);
-        if (cur + n > end) fatal("nce: stub region too small");
+        if (cur > end || n > end - cur) {
+            if (!safe) fatal("nce: stub region too small");
+            failed = true;
+            cur = base;
+            common = ret = base;
+            return false;
+        }
         std::memcpy(reinterpret_cast<void*>(cur), nce_region_start, n);
         common = cur + uint64_t(nce_common - nce_region_start);
         ret = cur + uint64_t(nce_return - nce_region_start);
         cur += (n + 15) & ~size_t(15);
+        return true;
     }
 };
 
@@ -551,70 +566,128 @@ void init() {
         st<uint32_t>(a + 8, b_to(a + 8, r.common));
         st<uint32_t>(a + 12, 0xD4200000);  // brk #0
     }
-    if (!protect(kThunkBase, kThunkSize + kThunkExtra, PROT_READ | PROT_EXEC))
-        fatal("nce: this system does not let the app run code it loaded (mprotect PROT_EXEC failed)");
-    clear_cache(kThunkBase, kThunkSize + kThunkExtra);
-    log("nce: native execution, counter %llu Hz (x%.6f to the Switch's 19.2 MHz), page size %llu",
-        (unsigned long long)freq, double(g_tick_mul) / double(uint64_t(1) << 32), (unsigned long long)page_size());
-}
-
-void prepare_module(const LoadedModule& m) {
+    if (!protect(kThunkBase, kThunkSize + kThunkExtra, PROT_READ | static bool prepare_module_impl(const LoadedModule& m, bool optional) {
     const ModuleInfo* mi = m.info;
     Region r;
+    r.safe = optional;
     r.base = r.cur = m.base + ((m.size + 0xFFFF) & ~uint64_t(0xFFFF));
     r.end = r.base + kRegionSize;
-    if (!commit(r.base, kRegionSize)) fatal("nce: no room for %s's stubs at %llx", mi->name, (unsigned long long)r.base);
-    r.copy_common();
+
+    if (!commit(r.base, kRegionSize)) {
+        if (!optional)
+            fatal("nce: no room for %s's stubs at %llx", mi->name, (unsigned long long)r.base);
+        log("nce: optional %s skipped: cannot commit stub region at %llx",
+            mi->name, (unsigned long long)r.base);
+        return false;
+    }
+
+    if (!r.copy_common()) {
+        decommit(r.base, kRegionSize);
+        log("nce: optional %s skipped: stub region is too small", mi->name);
+        return false;
+    }
 
     const uint64_t text = m.base + mi->text, text_end = text + mi->text_size;
+    size_t svc_start = g_svc_sites.size();
+    size_t svc_need = 0;
+    if (optional) {
+        for (uint64_t pc = text; pc < text_end; pc += 4) {
+            const uint32_t w = ld<uint32_t>(pc);
+            if ((w & 0xFFE0001Fu) == 0xD4000001u) ++svc_need;
+        }
+        if (svc_start > 0x10000 || svc_need > 0x10000 - svc_start) {
+            decommit(r.base, kRegionSize);
+            log("nce: optional %s skipped: SVC-site capacity exceeded", mi->name);
+            return false;
+        }
+    }
+
     size_t svcs = 0, tls = 0, counters = 0, others = 0;
     for (uint64_t pc = text; pc < text_end; pc += 4) {
         const uint32_t w = ld<uint32_t>(pc);
         uint64_t stub = 0;
-        if ((w & 0xFFE0001Fu) == 0xD4000001u) {  // svc #imm
-            if (g_svc_sites.size() >= 0x10000) fatal("nce: too many svc sites");
+        if ((w & 0xFFE0001Fu) == 0xD4000001u) {
+            if (g_svc_sites.size() >= 0x10000) {
+                if (!optional) fatal("nce: too many svc sites");
+                r.failed = true;
+                break;
+            }
             g_svc_sites.push_back({(w >> 5) & 0xFFFF, pc});
             stub = svc_stub(r, uint32_t(g_svc_sites.size() - 1), pc);
             svcs++;
-        } else if ((w & 0xFFD00000u) == 0xD5100000u) {  // mrs / msr (register)
+        } else if ((w & 0xFFD00000u) == 0xD5100000u) {
             const bool read = w & (1u << 21);
             const uint32_t sysreg = ((w >> 5) & 0x7FFF) | 0x8000, n = w & 31;
             if (n == 31 && read && (sysreg == 0xDE82 || sysreg == 0xDE83 || sysreg == 0xDF01 || sysreg == 0xDF02)) {
-                st<uint32_t>(pc, kNop);  // a read into xzr
+                st<uint32_t>(pc, kNop);
                 continue;
             }
-            if (read && (sysreg == 0xDE83 || sysreg == 0xDE82)) {  // TPIDRRO_EL0 / TPIDR_EL0
+            if (read && (sysreg == 0xDE83 || sysreg == 0xDE82)) {
                 stub = r.emit(mrs_tpidr(n));
                 r.emit(ldr_off(n, n, sysreg == 0xDE83 ? 0x118 : 0x110));
                 r.emit(b_to(r.cur, pc + 4));
                 tls++;
-            } else if (!read && sysreg == 0xDE82) {  // msr TPIDR_EL0, xN
-                const uint32_t s = n == 0 ? 1 : 0;
-                stub = r.emit(0xF81F0FE0u | s);  // str xS, [sp, #-16]!
-                r.emit(mrs_tpidr(s));
-                r.emit(str_off(n, s, 0x110));
-                r.emit(0xF84107E0u | s);  // ldr xS, [sp], #16
+            } else if (!read && sysreg == 0xDE82) {
+                const uint32_t reg = n == 0 ? 1 : 0;
+                stub = r.emit(0xF81F0FE0u | reg);
+                r.emit(mrs_tpidr(reg));
+                r.emit(str_off(n, reg, 0x110));
+                r.emit(0xF84107E0u | reg);
                 r.emit(b_to(r.cur, pc + 4));
                 tls++;
-            } else if (read && (sysreg == 0xDF01 || sysreg == 0xDF02)) {  // CNTPCT_EL0 / CNTVCT_EL0
+            } else if (read && (sysreg == 0xDF01 || sysreg == 0xDF02)) {
                 stub = counter_stub(r, n, pc);
                 counters++;
-            } else if (read && sysreg == 0xDF00) {  // CNTFRQ_EL0
+            } else if (read && sysreg == 0xDF00) {
                 stub = r.cur;
                 const uint64_t ldr = r.emit(0);
                 r.emit(b_to(r.cur, pc + 4));
                 st<uint32_t>(ldr, ldr_literal(ldr, r.emit64(19200000), n));
                 counters++;
             } else if (sysreg != 0xDA20 && sysreg != 0xDA21 && sysreg != 0xDA10 && sysreg != 0xD801 &&
-                       sysreg != 0xD807) {  // FPCR, FPSR, NZCV, CTR_EL0, DCZID_EL0 run as they are
+                       sysreg != 0xD807) {
                 if (others++ < 16)
-                    log("nce: %s %#x at %s left as is", read ? "mrs" : "msr", sysreg, describe(pc).c_str());
+                    log("nce: %s %#x at %llx left as is", read ? "mrs" : "msr", sysreg,
+                        (unsigned long long)pc);
             }
         }
+        if (r.failed) break;
         if (stub) st<uint32_t>(pc, b_to(pc, stub));
     }
-    if (!protect(text, mi->text_size, PROT_READ | PROT_EXEC) || !protect(r.base, kRegionSize, PROT_READ | PROT_EXEC))
-        fatal("nce: this system does not let the app run code it loaded (mprotect PROT_EXEC failed)");
+
+    if (r.failed) {
+        g_svc_sites.resize(svc_start);
+        decommit(r.base, kRegionSize);
+        log("nce: optional %s skipped: stub region capacity exceeded", mi->name);
+        return false;
+    }
+
+    if (!protect(text, mi->text_size, PROT_READ | PROT_EXEC) ||
+        !protect(r.base, kRegionSize, PROT_READ | PROT_EXEC)) {
+        if (!optional)
+            fatal("nce: this system does not let the app run code it loaded (mprotect PROT_EXEC failed)");
+        g_svc_sites.resize(svc_start);
+        decommit(r.base, kRegionSize);
+        log("nce: optional %s skipped: executable-memory protection failed", mi->name);
+        return false;
+    }
+
+    clear_cache(text, mi->text_size);
+    clear_cache(r.base, r.cur - r.base);
+    log("nce: %s ready: %zu svc, %zu TLS and %zu counter sites patched, stubs %llu bytes",
+        mi->name, svcs, tls, counters, (unsigned long long)(r.cur - r.base));
+    std::lock_guard lk(g_regions_lock);
+    g_regions[m.base] = r;
+    return true;
+}
+
+void prepare_module(const LoadedModule& m) {
+    (void)prepare_module_impl(m, false);
+}
+
+bool prepare_module_optional(const LoadedModule& m) {
+    return prepare_module_impl(m, true);
+} does not let the app run code it loaded (mprotect PROT_EXEC failed)");
     clear_cache(text, mi->text_size);
     clear_cache(r.base, r.cur - r.base);
     log("nce: %s ready: %zu svc, %zu TLS and %zu counter sites patched, stubs %llu bytes", mi->name, svcs, tls,

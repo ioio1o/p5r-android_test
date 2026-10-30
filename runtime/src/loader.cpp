@@ -260,44 +260,175 @@ static bool recompiled_only(const char* name) {
 }
 
 void load_modules(const ModuleInfo* const* mods, size_t count, const std::string& data_dir,
-                  const uint8_t* const* images) {
-    // Map every module first so symbols of all of them are known before relocating.
+                  const uint8_t* const* images, size_t optional_index) {
+    const size_t first_new_module = g_modules.size();
+    const bool has_optional = optional_index < count;
+
+#if NX_NCE
+    LoadedModule optional_lm{};
+    bool optional_ready = false;
+
+    // Map and NCE-prepare the optional module before publishing its exports.
+    // This lets a failed optional module disappear without affecting main/sdk.
+    if (has_optional) {
+        const ModuleInfo* mi = mods[optional_index];
+
+        // NCE preparation makes optional text RX before relocation.
+        // Skip the optional module if any relocation would write into text.
+        bool text_relocation = false;
+        for (size_t k = 0; k < mi->reloc_count; k++) {
+            const uint64_t offset = mi->relocs[k].offset;
+            if (offset >= mi->text && offset - mi->text < mi->text_size) {
+                text_relocation = true;
+                break;
+            }
+        }
+
+        constexpr uint64_t kOptionalSlotSize = 0x10000000;
+        constexpr uint64_t kNceRegionSize = 0x40000;
+
+        const bool arithmetic_ok =
+            mi->data <= UINT64_MAX - mi->data_size &&
+            mi->bss <= UINT64_MAX - mi->bss_size;
+
+        const uint64_t image_size = arithmetic_ok ? mi->data + mi->data_size : 0;
+        const uint64_t bss_end = arithmetic_ok ? mi->bss + mi->bss_size : 0;
+        const bool page_alignment_ok =
+            arithmetic_ok && bss_end <= UINT64_MAX - 0xFFF;
+        const uint64_t size =
+            page_alignment_ok ? ((bss_end + 0xFFF) & ~uint64_t(0xFFF)) : 0;
+        const bool nce_alignment_ok =
+            page_alignment_ok && size <= UINT64_MAX - 0xFFFF;
+        const uint64_t nce_offset =
+            nce_alignment_ok ? ((size + 0xFFFF) & ~uint64_t(0xFFFF)) : 0;
+        const bool slot_arithmetic_ok =
+            nce_alignment_ok &&
+            mi->base <= UINT64_MAX - kOptionalSlotSize &&
+            mi->base + nce_offset <= UINT64_MAX - kNceRegionSize;
+
+        if (text_relocation) {
+            log("exefs: optional %s skipped: relocation targets its text section", mi->name);
+        } else if (!slot_arithmetic_ok ||
+            image_size > size || nce_offset > kOptionalSlotSize ||
+            kNceRegionSize > kOptionalSlotSize - nce_offset) {
+            log("exefs: optional %s skipped: image/BSS/NCE region exceeds its 256 MiB slot",
+                mi->name);
+        } else if (!commit(mi->base, size)) {
+            log("exefs: optional %s skipped: cannot commit module memory", mi->name);
+        } else {
+            bool copied = true;
+            if (images) {
+                std::memcpy(reinterpret_cast<void*>(mi->base), images[optional_index], image_size);
+            } else {
+                const std::string path = data_dir + "/" + mi->name + ".bin";
+                std::ifstream f(path, std::ios::binary);
+                if (!f) {
+                    log("exefs: optional %s skipped: missing %s", mi->name, path.c_str());
+                    copied = false;
+                } else {
+                    f.read(reinterpret_cast<char*>(mi->base), std::streamsize(image_size));
+                    if (uint64_t(f.gcount()) != image_size) {
+                        log("exefs: optional %s skipped: incomplete image", mi->name);
+                        copied = false;
+                    }
+                }
+            }
+
+            if (copied) {
+                vm_set(mi->base + mi->text, mi->text_size, kMemCode, 5);
+                vm_set(mi->base + mi->ro, mi->ro_size, kMemCode, 1);
+                vm_set(mi->base + mi->data, size - mi->data, kMemCodeData, 3);
+
+                optional_lm = {
+                    mi, mi->base, size,
+                    mi->func_count ? new Fn[mi->text_size / 4]() : nullptr
+                };
+
+                for (size_t k = 0; k < mi->func_count; k++)
+                    optional_lm.table[mi->funcs[k].offset / 4] = mi->funcs[k].fn;
+
+                optional_ready = nce::prepare_module_optional(optional_lm);
+                if (!optional_ready) {
+                    vm_set(mi->base, size, kMemFree, 0);
+                    plat::decommit(mi->base, size);
+                    log("exefs: optional %s discarded after NCE preparation failure", mi->name);
+                    delete[] optional_lm.table;
+                    optional_lm = {};
+                }
+            } else {
+                plat::decommit(mi->base, size);
+            }
+        }
+    }
+#else
+    (void)has_optional;
+#endif
+
+    // Map modules in caller-specified link order. The optional module is
+    // already mapped and prepared; a failed optional module is simply omitted.
     for (size_t i = 0; i < count; i++) {
+#if NX_NCE
+        if (has_optional && i == optional_index) {
+            if (!optional_ready) continue;
+            g_modules.push_back(optional_lm);
+            if (g_fast_count < 4 && optional_lm.table)
+                g_fast[g_fast_count++] = {optional_lm.base, optional_lm.info->text_size, optional_lm.table};
+            const ModuleInfo* mi = optional_lm.info;
+            for (size_t k = 0; k < mi->symbol_count; k++) {
+                const Symbol& sym = mi->symbols[k];
+                if (sym.imported || !sym.name[0] || sym.bind == 0) continue;
+                auto it = g_exports.find(sym.name);
+                if (it == g_exports.end())
+                    g_exports[sym.name] = mi->base + sym.value;
+            }
+            log("loaded optional %s at %llx (%llu functions, %llu relocs)",
+                mi->name, (unsigned long long)mi->base,
+                (unsigned long long)mi->func_count,
+                (unsigned long long)mi->reloc_count);
+            continue;
+        }
+#endif
         const ModuleInfo* mi = mods[i];
-        uint64_t image = mi->data + mi->data_size;
-        uint64_t size = ((mi->bss + mi->bss_size) + 0xFFF) & ~0xFFFull;
+        const uint64_t image = mi->data + mi->data_size;
+        const uint64_t size = ((mi->bss + mi->bss_size) + 0xFFF) & ~0xFFFull;
         if (!commit(mi->base, size)) fatal("cannot commit module %s", mi->name);
-        if (images) {  // native execution: the image the NSO reader made (nce/nso.cpp)
+        if (images) {
             std::memcpy(reinterpret_cast<void*>(mi->base), images[i], image);
         } else {
-            std::string path = data_dir + "/" + mi->name + ".bin";
+            const std::string path = data_dir + "/" + mi->name + ".bin";
             std::ifstream f(path, std::ios::binary);
             if (!f) fatal("missing %s (run tools/nso2bin.py)", path.c_str());
             f.read(reinterpret_cast<char*>(mi->base), std::streamsize(image));
-            if (uint64_t(f.gcount()) != image) fatal("%s: expected %llx bytes", path.c_str(), (unsigned long long)image);
+            if (uint64_t(f.gcount()) != image)
+                fatal("%s: expected %llx bytes", path.c_str(), (unsigned long long)image);
         }
         vm_set(mi->base + mi->text, mi->text_size, kMemCode, 5);
         vm_set(mi->base + mi->ro, mi->ro_size, kMemCode, 1);
         vm_set(mi->base + mi->data, size - mi->data, kMemCodeData, 3);
 
         LoadedModule lm{mi, mi->base, size, mi->func_count ? new Fn[mi->text_size / 4]() : nullptr};
-        for (size_t k = 0; k < mi->func_count; k++) lm.table[mi->funcs[k].offset / 4] = mi->funcs[k].fn;
+        for (size_t k = 0; k < mi->func_count; k++)
+            lm.table[mi->funcs[k].offset / 4] = mi->funcs[k].fn;
         g_modules.push_back(lm);
-        if (g_fast_count < 4 && lm.table) g_fast[g_fast_count++] = {lm.base, mi->text_size, lm.table};
+        if (g_fast_count < 4 && lm.table)
+            g_fast[g_fast_count++] = {lm.base, mi->text_size, lm.table};
 
         for (size_t k = 0; k < mi->symbol_count; k++) {
-            const Symbol& s = mi->symbols[k];
-            if (s.imported || !s.name[0] || s.bind == 0) continue;  // skip locals
-            auto it = g_exports.find(s.name);
-            if (it == g_exports.end() || s.bind == 1)  // global beats weak; first global wins
-                if (it == g_exports.end()) g_exports[s.name] = mi->base + s.value;
+            const Symbol& sym = mi->symbols[k];
+            if (sym.imported || !sym.name[0] || sym.bind == 0) continue;
+            auto it = g_exports.find(sym.name);
+            if (it == g_exports.end() || sym.bind == 1) {
+                if (it == g_exports.end()) g_exports[sym.name] = mi->base + sym.value;
+            }
         }
-        log("loaded %s at %llx (%llu functions, %llu relocs)", mi->name, (unsigned long long)mi->base,
-            (unsigned long long)mi->func_count, (unsigned long long)mi->reloc_count);
+        log("loaded %s at %llx (%llu functions, %llu relocs)", mi->name,
+            (unsigned long long)mi->base, (unsigned long long)mi->func_count,
+            (unsigned long long)mi->reloc_count);
     }
 
     size_t hle = 0, missing = 0, linked = 0;
-    for (auto& lm : g_modules) {
+    for (size_t index = first_new_module; index < g_modules.size(); index++) {
+        auto& lm = g_modules[index];
         const ModuleInfo* mi = lm.info;
         for (size_t k = 0; k < mi->reloc_count; k++) {
             const Reloc& r = mi->relocs[k];
@@ -306,34 +437,41 @@ void load_modules(const ModuleInfo* const* mods, size_t count, const std::string
                 *slot = lm.base + uint64_t(r.addend);
                 continue;
             }
-            if (r.type != R_AARCH64_GLOB_DAT && r.type != R_AARCH64_JUMP_SLOT && r.type != R_AARCH64_ABS64) {
-                log("%s: relocation type %u at %llx not handled", mi->name, r.type, (unsigned long long)r.offset);
+            if (r.type != R_AARCH64_GLOB_DAT && r.type != R_AARCH64_JUMP_SLOT &&
+                r.type != R_AARCH64_ABS64) {
+                log("%s: relocation type %u at %llx not handled", mi->name, r.type,
+                    (unsigned long long)r.offset);
                 continue;
             }
-            const Symbol& s = mi->symbols[r.sym];
+            const Symbol& sym = mi->symbols[r.sym];
             uint64_t target = 0;
-            if (s.type == 2 || s.imported) {
-                if (hle_lookup(s.name) && !recompiled_only(s.name)) {
-                    target = hle_address(s.name);
+            if (sym.type == 2 || sym.imported) {
+                if (hle_lookup(sym.name) && !recompiled_only(sym.name)) {
+                    target = hle_address(sym.name);
                     hle++;
                 }
             }
             if (!target) {
-                target = find_symbol(s.name);
+                target = find_symbol(sym.name);
                 if (target) linked++;
             }
-            if (!target && !s.imported) target = lm.base + s.value;
+            if (!target && !sym.imported) target = lm.base + sym.value;
             if (!target) {
-                // Unresolved: functions get a logging stub; data stays null.
-                if (s.type == 2 || s.type == 0) target = hle_address(s.name);
+                if (sym.type == 2 || sym.type == 0) target = hle_address(sym.name);
                 missing++;
             }
             *slot = target + uint64_t(r.addend);
         }
     }
     log("linked: %zu to HLE, %zu across modules, %zu unresolved", hle, linked, missing);
+
 #if NX_NCE
-    for (auto& lm : g_modules) nce::prepare_module(lm);
+    for (size_t index = first_new_module; index < g_modules.size(); index++) {
+        auto& lm = g_modules[index];
+        if (has_optional && optional_ready && lm.base == mods[optional_index]->base)
+            continue; // already prepared safely before publishing exports
+        nce::prepare_module(lm);
+    }
 #endif
 }
 

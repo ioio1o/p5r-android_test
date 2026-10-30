@@ -21,6 +21,9 @@ struct NsoModule {
     std::vector<std::string> names;  // the symbols' names (info.symbols[k].name points here)
     std::vector<Reloc> relocs;
     std::vector<uint64_t> init_array, fini_array;
+    uint32_t mod0_offset = 0;
+    uint64_t dt_init = 0;
+    uint64_t dt_init_array = 0, dt_init_array_size = 0;
     std::vector<uint8_t> build_id;   // the NSO header's module id (32 bytes)
 };
 

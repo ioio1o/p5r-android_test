@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -158,7 +159,7 @@ void boot() {
     // P5R 1.0.2 test: only execute modules from the explicitly selected game image.
     // Never fall back to a separately extracted ExeFS directory.
     nce::init();
-    static std::unique_ptr<nce::NsoModule> nso[2];
+    static std::unique_ptr<nce::NsoModule> nso[3];
     const char* names[2] = {"main", "sdk"};
     const nxi::GameImage* image = game_image();
     if (!image)
@@ -197,10 +198,114 @@ void boot() {
     if (want && !main_matches)
         fatal("exefs/main is build %s, not %s: this port is made for one version of the game (%s)",
               main_id.c_str(), want, "use the Persona 5 Royal 1.0.2 ExeFS");
-    g_main = &nso[0]->info, g_sdk = &nso[1]->info;
-    const ModuleInfo* mods[] = {g_main, g_sdk};
-    const uint8_t* images[] = {nso[0]->image.data(), nso[1]->image.data()};
-    load_modules(mods, 2, "", images);
+    g_main = &nso[0]->info;
+    g_sdk = &nso[1]->info;
+
+    // Find the winning mod using the same alphabetical priority as the
+    // existing ROMFS overlay: sorted ascending, last matching mod wins.
+    namespace fs = std::filesystem;
+    fs::path selected_subsdk9;
+    std::vector<fs::path> mod_dirs;
+    const fs::path mods_root = fs::u8path(plat::data_root()) / "mods";
+    std::error_code ec;
+    if (fs::is_directory(mods_root, ec)) {
+        for (fs::directory_iterator it(mods_root, ec), end; !ec && it != end; it.increment(ec)) {
+            std::error_code entry_ec;
+            if (!it->is_directory(entry_ec) || entry_ec) continue;
+
+            const std::string folder = it->path().filename().string();
+            if (folder.empty() || folder[0] == '.' || folder[0] == '_') continue;
+
+            std::error_code romfs_ec, subsdk_ec;
+            const bool has_romfs = fs::is_directory(it->path() / "romfs", romfs_ec);
+            const bool has_subsdk9 = fs::is_regular_file(
+                it->path() / "exefs" / "subsdk9", subsdk_ec);
+
+            if (has_romfs && !romfs_ec && has_subsdk9 && !subsdk_ec)
+                mod_dirs.push_back(it->path());
+        }
+    }
+    std::sort(mod_dirs.begin(), mod_dirs.end());
+    if (!mod_dirs.empty())
+        selected_subsdk9 = mod_dirs.back() / "exefs" / "subsdk9";
+
+    size_t module_count = 2;
+    const ModuleInfo* mods[3] = {g_main, nullptr, g_sdk};
+    const uint8_t* images[3] = {
+        nso[0]->image.data(), nullptr, nso[1]->image.data()
+    };
+    size_t optional_index = static_cast<size_t>(-1);
+
+    if (!selected_subsdk9.empty()) {
+        if (!main_matches) {
+            log("exefs: optional subsdk9 skipped: main version mismatch");
+        } else if (!plat::reserve(0x4020000000ull, 0x10000000ull)) {
+            log("exefs: optional subsdk9 skipped: cannot reserve 256 MiB slot");
+        } else {
+            std::string error;
+            nso[2] = nce::load_nso(selected_subsdk9.string(), "subsdk9",
+                                   0x4020000000ull, error);
+            if (!nso[2]) {
+                log("exefs: optional subsdk9 skipped: %s", error.c_str());
+            } else {
+                const auto& mi = nso[2]->info;
+                log("exefs: optional subsdk9 candidate: %s", selected_subsdk9.string().c_str());
+                log("exefs: subsdk9 MOD0=%#x DT_INIT=%#llx DT_INIT_ARRAY=%#llx size=%#llx entries=%zu",
+                    nso[2]->mod0_offset,
+                    (unsigned long long)nso[2]->dt_init,
+                    (unsigned long long)nso[2]->dt_init_array,
+                    (unsigned long long)nso[2]->dt_init_array_size,
+                    nso[2]->init_array.size());
+
+                size_t collisions = 0;
+                for (size_t k = 0; k < mi.symbol_count; k++) {
+                    const Symbol& sym = mi.symbols[k];
+                    if (sym.imported || !sym.name[0] || sym.bind == 0) continue;
+                    bool collision = false;
+                    for (size_t j = 0; j < g_main->symbol_count; j++) {
+                        const Symbol& other = g_main->symbols[j];
+                        if (!other.imported && other.bind != 0 &&
+                            std::strcmp(sym.name, other.name) == 0) {
+                            collision = true;
+                            break;
+                        }
+                    }
+                    if (!collision) {
+                        for (size_t j = 0; j < g_sdk->symbol_count; j++) {
+                            const Symbol& other = g_sdk->symbols[j];
+                            if (!other.imported && other.bind != 0 &&
+                                std::strcmp(sym.name, other.name) == 0) {
+                                collision = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (collision) ++collisions;
+                }
+                log("exefs: subsdk9 exported names colliding with main/sdk: %zu", collisions);
+
+                char first_words[16 * 9 + 1] = {};
+                size_t used = 0;
+                const size_t text_at = size_t(mi.text);
+                for (size_t k = 0; k < 16 && text_at + k * 4 + 4 <= nso[2]->image.size(); k++) {
+                    uint32_t word = 0;
+                    std::memcpy(&word, nso[2]->image.data() + text_at + k * 4, 4);
+                    int n = std::snprintf(first_words + used, sizeof(first_words) - used,
+                                          "%s%08X", k ? " " : "", word);
+                    if (n <= 0 || size_t(n) >= sizeof(first_words) - used) break;
+                    used += size_t(n);
+                }
+                log("exefs: subsdk9 first text words: %s", first_words);
+
+                mods[1] = &nso[2]->info;
+                images[1] = nso[2]->image.data();
+                module_count = 3;
+                optional_index = 1;
+            }
+        }
+    }
+
+    load_modules(mods, module_count, "", images, optional_index);
 #else
     g_main = &nx_module_main, g_sdk = &nx_module_sdk;
     const ModuleInfo* mods[] = {g_main, g_sdk};

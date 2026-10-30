@@ -11,7 +11,8 @@ namespace nx::nce {
 namespace {
 
 constexpr int64_t DT_NULL = 0, DT_PLTRELSZ = 2, DT_STRTAB = 5, DT_SYMTAB = 6, DT_RELA = 7, DT_RELASZ = 8,
-                  DT_SYMENT = 11, DT_JMPREL = 23, DT_INIT_ARRAY = 25, DT_FINI_ARRAY = 26, DT_INIT_ARRAYSZ = 27,
+                  DT_INIT = 12, DT_SYMENT = 11, DT_JMPREL = 23,
+                  DT_INIT_ARRAY = 25, DT_FINI_ARRAY = 26, DT_INIT_ARRAYSZ = 27,
                   DT_FINI_ARRAYSZ = 28;
 
 template <typename T>
@@ -125,6 +126,7 @@ std::unique_ptr<NsoModule> load_nso_bytes(const std::vector<uint8_t>& raw, const
         error = path + ": MOD0 not found";
         return nullptr;
     }
+    m->mod0_offset = mod0;
     int32_t rel[5];
     for (int i = 0; i < 5; i++) rd(m->image, mod0 + 4 + i * 4, rel[i]);
     const uint64_t dyn_off = mod0 + int64_t(rel[0]);
@@ -142,6 +144,9 @@ std::unique_ptr<NsoModule> load_nso_bytes(const std::vector<uint8_t>& raw, const
         if (tag == DT_NULL) break;
         dyn.emplace(tag, val);  // the first one wins, as nso.py
     }
+    m->dt_init = dyn.count(DT_INIT) ? dyn[DT_INIT] : 0;
+    m->dt_init_array = dyn.count(DT_INIT_ARRAY) ? dyn[DT_INIT_ARRAY] : 0;
+    m->dt_init_array_size = dyn.count(DT_INIT_ARRAYSZ) ? dyn[DT_INIT_ARRAYSZ] : 0;
     if (!dyn.count(DT_STRTAB) || !dyn.count(DT_SYMTAB)) {
         error = path + ": no symbol table";
         return nullptr;
