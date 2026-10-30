@@ -139,6 +139,9 @@ NX_HLE("__process_return", process_return);
 #if NX_NCE
 namespace {
 
+static uint64_t g_skyline_function_hook_requests = 0;
+static uint64_t g_skyline_inline_hook_requests = 0;
+
 template <typename T>
 bool nro_read(const std::vector<uint8_t>& image, uint64_t offset, T& value) {
     if (offset > image.size() || sizeof(T) > image.size() - offset)
@@ -315,10 +318,13 @@ static void skyline_get_region(CPU& c) {
 }
 
 static void skyline_tcp_send_raw(CPU& c) {
+    static uint64_t sequence = 0;
     const uint64_t address = c.x[0];
+    const uint64_t write_sequence = ++sequence;
 
     if (!guest_range_ok(address, 1, 1)) {
-        log("skyline: TCP rejected unreadable pointer %llx",
+        log("skyline: TCP write #%llu buffer=%llx length=unreadable",
+            (unsigned long long)write_sequence,
             (unsigned long long)address);
         return;
     }
@@ -334,12 +340,32 @@ static void skyline_tcp_send_raw(CPU& c) {
 
         const char ch =
             *reinterpret_cast<const char*>(address + count);
-
         if (!ch)
             break;
-
         raw[count] = ch;
     }
+
+    const size_t write_length = count;
+    const size_t preview_count = std::min<size_t>(write_length, 48);
+    char hex[48 * 3 + 1]{};
+    char ascii[49]{};
+
+    for (size_t i = 0; i < preview_count; ++i) {
+        const unsigned char ch = static_cast<unsigned char>(raw[i]);
+        const size_t offset = i * 3;
+        std::snprintf(
+            hex + offset, sizeof(hex) - offset,
+            "%02x%s", ch, i + 1 < preview_count ? " " : ""
+        );
+        ascii[i] = ch >= 0x20 && ch <= 0x7e
+            ? static_cast<char>(ch) : '.';
+    }
+
+    log("skyline: TCP write #%llu buffer=%llx length=%zu "
+        "preview_hex=[%s] preview_ascii=\"%s\"",
+        (unsigned long long)write_sequence,
+        (unsigned long long)address,
+        write_length, hex, ascii);
 
     while (count &&
            (raw[count - 1] == '\n' || raw[count - 1] == '\r')) {
@@ -357,12 +383,12 @@ static void skyline_tcp_send_raw(CPU& c) {
                 : '.'
         );
     }
-
     log("plugin: %s", sanitized.c_str());
 }
 
 static void skyline_a64_hook_function(CPU& c) {
-    const uint64_t target = c.x[0];
+        ++g_skyline_function_hook_requests;
+const uint64_t target = c.x[0];
     const uint64_t replacement = c.x[1];
     const uint64_t result_slot = c.x[2];
 
@@ -393,7 +419,8 @@ static void skyline_a64_hook_function(CPU& c) {
 }
 
 static void skyline_a64_inline_hook(CPU& c) {
-    const uint64_t target = c.x[0];
+        ++g_skyline_inline_hook_requests;
+const uint64_t target = c.x[0];
     const uint64_t replacement = c.x[1];
 
     skyline_log_hook_target("A64InlineHook", target);
@@ -1071,10 +1098,25 @@ static void run_skyline_plugins(CPU& c) {
             plugin.name.c_str(),
             (unsigned long long)entry);
 
+        const uint64_t function_hooks_before =
+            g_skyline_function_hook_requests;
+        const uint64_t inline_hooks_before =
+            g_skyline_inline_hook_requests;
+
         call_preserving(c, entry);
+        const bool main_returned_normally = true;
 
         log("skyline: %s plugin main returned",
             plugin.name.c_str());
+
+        log("skyline: %s post-main hooks: function_requests=%llu "
+            "inline_requests=%llu installed=0 main_returned=%s",
+            plugin.name.c_str(),
+            (unsigned long long)(
+                g_skyline_function_hook_requests - function_hooks_before),
+            (unsigned long long)(
+                g_skyline_inline_hook_requests - inline_hooks_before),
+            main_returned_normally ? "yes" : "no");
 
         log("skyline: %s post-main imports: plugin=%zu HLE=%zu main=%zu "
             "SDK=%zu unresolved=%zu; relocations: RELATIVE=%zu "

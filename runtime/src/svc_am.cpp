@@ -228,6 +228,10 @@ std::shared_ptr<Service> library_applet_creator() {
 std::shared_ptr<Service> application_functions() {
     return svc("IApplicationFunctions", [](Service& s) {
         s.cmds[23] = [](IpcCtx& c) {  // GetDisplayVersion
+            static uint64_t call_count = 0;
+            const uint64_t caller_lr = c.cpu ? c.cpu->x[30] : 0;
+            ++call_count;
+
             char version[0x10]{};
             const char* value = game::kInfo.display_version ? game::kInfo.display_version : "";
 
@@ -239,6 +243,22 @@ std::shared_ptr<Service> application_functions() {
                 std::memcpy(version, value, count);
 
             c.out.insert(c.out.end(), version, version + sizeof(version));
+
+            char raw_hex[sizeof(version) * 3]{};
+            for (size_t i = 0; i < sizeof(version); ++i) {
+                const size_t offset = i * 3;
+                std::snprintf(
+                    raw_hex + offset, sizeof(raw_hex) - offset,
+                    "%02x%s",
+                    static_cast<unsigned char>(version[i]),
+                    i + 1 < sizeof(version) ? " " : ""
+                );
+            }
+
+            log("am: GetDisplayVersion call=%llu caller_lr=%llx raw16=[%s]",
+                (unsigned long long)call_count,
+                (unsigned long long)caller_lr,
+                raw_hex);
             log("am: GetDisplayVersion -> %s", version);
             return 0u;
         };
