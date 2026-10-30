@@ -185,272 +185,493 @@ static bool module_exports(const ModuleInfo* module, const char* name) {
     return false;
 }
 
-static void inspect_skyline_nro(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) {
-        log("skyline: cannot open %s", path.string().c_str());
+
+struct SkylinePluginRuntime {
+    std::string name;
+    std::unique_ptr<nce::NroImage> nro;
+    std::vector<std::string> names;
+    std::vector<Symbol> symbols;
+    std::vector<Reloc> relocs;
+    ModuleInfo info{};
+    uint64_t base = 0;
+    uint64_t mapped_size = 0;
+};
+
+static std::vector<std::unique_ptr<SkylinePluginRuntime>> g_skyline_plugins;
+static uint64_t g_skyline_next_slot = 0;
+
+static constexpr uint64_t kSkylinePluginBase = 0x4030000000ull;
+static constexpr uint64_t kSkylinePluginSlotSize = 0x10000000ull;
+static constexpr uint64_t kSkylinePluginSlotCount = 4;
+
+static uint64_t skyline_module_symbol(const ModuleInfo* module,
+                                      const char* name) {
+    if (!module || !name || !*name)
+        return 0;
+
+    for (size_t i = 0; i < module->symbol_count; ++i) {
+        const Symbol& sym = module->symbols[i];
+        if (!sym.imported && sym.bind != 0 && sym.name &&
+            std::strcmp(sym.name, name) == 0)
+            return module->base + sym.value;
+    }
+    return 0;
+}
+
+static uint64_t skyline_readable_remaining(uint64_t address) {
+    auto check = [address](uint64_t base, uint64_t size) -> uint64_t {
+        if (size && address >= base && address - base < size)
+            return size - (address - base);
+        return 0;
+    };
+
+    for (const auto& p : g_skyline_plugins) {
+        uint64_t n = check(p->base, p->mapped_size);
+        if (n) return n;
+    }
+
+    const ModuleInfo* modules[] = {g_main, g_sdk};
+    for (const ModuleInfo* m : modules) {
+        if (!m) continue;
+        const uint64_t ends[] = {
+            m->text + m->text_size,
+            m->ro + m->ro_size,
+            m->data + m->data_size + m->bss_size
+        };
+        for (uint64_t end : ends) {
+            if (end && address >= m->base && address - m->base < end)
+                return end - (address - m->base);
+        }
+    }
+    return 0;
+}
+
+static void skyline_get_region(CPU& c) {
+    if (!g_main) {
+        c.x[0] = 0;
         return;
     }
 
-    const std::streamoff length = file.tellg();
-    if (length <= 0 || uint64_t(length) > SIZE_MAX) {
-        log("skyline: invalid file size: %s", path.string().c_str());
+    switch (c.x[0]) {
+    case 0: c.x[0] = g_main->base + g_main->text; break;
+    case 1: c.x[0] = g_main->base + g_main->ro; break;
+    case 2: c.x[0] = g_main->base + g_main->data; break;
+    case 3: c.x[0] = g_main->base + g_main->bss; break;
+    case 4: c.x[0] = kHeapBase; break;
+    default: c.x[0] = 0; break;
+    }
+}
+
+static void skyline_tcp_send_raw(CPU& c) {
+    const uint64_t address = c.x[0];
+    const uint64_t remaining = skyline_readable_remaining(address);
+    if (!remaining) {
+        log("skyline_tcp_send_raw: rejected unmapped pointer %llx",
+            (unsigned long long)address);
         return;
     }
 
-    std::vector<uint8_t> raw(static_cast<size_t>(length));
-    file.seekg(0, std::ios::beg);
-    file.read(reinterpret_cast<char*>(raw.data()), length);
-    if (!file || file.gcount() != length) {
-        log("skyline: incomplete read: %s", path.string().c_str());
+    const size_t limit = static_cast<size_t>(
+        std::min<uint64_t>(remaining, 1024));
+    const char* text = reinterpret_cast<const char*>(address);
+    const void* end = std::memchr(text, 0, limit);
+    if (!end) {
+        log("skyline_tcp_send_raw: rejected unterminated string at %llx",
+            (unsigned long long)address);
         return;
     }
 
-    std::string error;
-    auto nro = nce::parse_nro_bytes(raw, path.string(), error);
-    if (!nro) {
-        log("skyline: invalid NRO: %s", error.c_str());
-        return;
-    }
+    std::string message(text, static_cast<const char*>(end) - text);
+    log("skyline_tcp: %s", message.c_str());
+}
 
-    const auto& image = nro->image;
+static void skyline_a64_hook_function(CPU& c) {
+    log("skyline: A64HookFunction no-op target=%llx replacement=%llx "
+        "result_slot=%llx (guest memory unchanged)",
+        (unsigned long long)c.x[0],
+        (unsigned long long)c.x[1],
+        (unsigned long long)c.x[2]);
+}
 
-    // MOD0 + 4 contains a signed offset to the dynamic table.
-    int32_t dynamic_relative = 0;
-    if (!nro_read(image, uint64_t(nro->mod0_offset) + 4, dynamic_relative)) {
-        log("skyline: %s: cannot read MOD0 dynamic offset", path.filename().string().c_str());
-        return;
-    }
+static void skyline_a64_inline_hook(CPU& c) {
+    log("skyline: A64InlineHook no-op target=%llx replacement=%llx "
+        "result_slot=none",
+        (unsigned long long)c.x[0],
+        (unsigned long long)c.x[1]);
+}
 
-    const int64_t dynamic_signed =
-        int64_t(nro->mod0_offset) + int64_t(dynamic_relative);
-    if (dynamic_signed < 0 || uint64_t(dynamic_signed) >= image.size()) {
-        log("skyline: %s: dynamic table is outside image", path.filename().string().c_str());
-        return;
-    }
+NX_HLE("getRegionAddress", skyline_get_region);
+NX_HLE("skyline_tcp_send_raw", skyline_tcp_send_raw);
+NX_HLE("A64HookFunction", skyline_a64_hook_function);
+NX_HLE("A64InlineHook", skyline_a64_inline_hook);
+
+struct SkylineElfRela {
+    uint64_t offset;
+    uint64_t info;
+    int64_t addend;
+};
+static_assert(sizeof(SkylineElfRela) == 24);
+
+static bool skyline_parse_dynamic(
+    const std::vector<uint8_t>& image,
+    uint64_t mod0,
+    uint64_t& hash,
+    uint64_t& strtab,
+    uint64_t& symtab,
+    uint64_t& strsz,
+    uint64_t& rela,
+    uint64_t& relasz,
+    uint64_t& relaent,
+    uint64_t& jmprel,
+    uint64_t& pltrelsz,
+    uint64_t& pltrel) {
+
+    int32_t relative = 0;
+    if (!nro_read(image, mod0 + 4, relative))
+        return false;
+
+    const int64_t dynamic = int64_t(mod0) + relative;
+    if (dynamic < 0 || uint64_t(dynamic) >= image.size())
+        return false;
 
     constexpr int64_t DT_NULL = 0;
     constexpr int64_t DT_HASH = 4;
     constexpr int64_t DT_STRTAB = 5;
     constexpr int64_t DT_SYMTAB = 6;
-    constexpr int64_t DT_STRSZ = 10;
-    constexpr int64_t DT_SYMENT = 11;
     constexpr int64_t DT_RELA = 7;
     constexpr int64_t DT_RELASZ = 8;
     constexpr int64_t DT_RELAENT = 9;
+    constexpr int64_t DT_STRSZ = 10;
+    constexpr int64_t DT_JMPREL = 23;
     constexpr int64_t DT_PLTRELSZ = 2;
     constexpr int64_t DT_PLTREL = 20;
-    constexpr int64_t DT_JMPREL = 23;
 
-    uint64_t hash = 0, strtab = 0, symtab = 0, strsz = 0, syment = 0;
-    uint64_t rela = 0, relasz = 0, relaent = 0;
-    uint64_t jmprel = 0, pltrelsz = 0, pltrel = 0;
     bool terminated = false;
-
-    // Elf64_Dyn entries are 16 bytes. Bound the scan even if the file is malformed.
     for (size_t i = 0; i < 4096; ++i) {
-        const uint64_t at = uint64_t(dynamic_signed) + uint64_t(i) * 16;
+        const uint64_t at = uint64_t(dynamic) + uint64_t(i) * 16;
         int64_t tag = 0;
         uint64_t value = 0;
-
         if (!nro_read(image, at, tag) || !nro_read(image, at + 8, value))
-            break;
-
+            return false;
         if (tag == DT_NULL) {
             terminated = true;
             break;
         }
 
         switch (tag) {
-            case DT_HASH:   hash = value; break;
-            case DT_STRTAB: strtab = value; break;
-            case DT_SYMTAB: symtab = value; break;
-            case DT_STRSZ:  strsz = value; break;
-            case DT_SYMENT: syment = value; break;
-            case DT_RELA: rela = value; break;
-            case DT_RELASZ: relasz = value; break;
-            case DT_RELAENT: relaent = value; break;
-            case DT_JMPREL: jmprel = value; break;
-            case DT_PLTRELSZ: pltrelsz = value; break;
-            case DT_PLTREL: pltrel = value; break;
-            default: break;
+        case DT_HASH: hash = value; break;
+        case DT_STRTAB: strtab = value; break;
+        case DT_SYMTAB: symtab = value; break;
+        case DT_STRSZ: strsz = value; break;
+        case DT_RELA: rela = value; break;
+        case DT_RELASZ: relasz = value; break;
+        case DT_RELAENT: relaent = value; break;
+        case DT_JMPREL: jmprel = value; break;
+        case DT_PLTRELSZ: pltrelsz = value; break;
+        case DT_PLTREL: pltrel = value; break;
+        default: break;
         }
     }
+    return terminated && hash && strtab && symtab && strsz &&
+           rela && relaent == sizeof(SkylineElfRela);
+}
 
+static bool skyline_load_rela_table(
+    const std::vector<uint8_t>& image,
+    uint64_t offset,
+    uint64_t size,
+    uint32_t symbol_count,
+    std::vector<Reloc>& output) {
+
+    if (!size)
+        return true;
+    if (size % sizeof(SkylineElfRela) || offset > image.size() ||
+        size > image.size() - offset)
+        return false;
+
+    const size_t count = static_cast<size_t>(size / sizeof(SkylineElfRela));
+    if (count > 1000000 || output.size() > 1000000 - count)
+        return false;
+
+    for (size_t i = 0; i < count; ++i) {
+        SkylineElfRela r{};
+        if (!nro_read(image, offset + i * sizeof(r), r))
+            return false;
+
+        const uint32_t type = uint32_t(r.info);
+        const uint32_t sym = uint32_t(r.info >> 32);
+        if (sym >= symbol_count)
+            return false;
+
+        output.push_back({r.offset, type, sym, r.addend});
+    }
+    return true;
+}
+
+static bool load_skyline_nro(const std::filesystem::path& path) {
     const std::string plugin_name = path.filename().string();
-    if (!terminated || !hash || !strtab || !symtab || !strsz ||
-        syment != sizeof(NroDynamicSymbol)) {
-        log("skyline: %s: missing or invalid dynamic symbol metadata", plugin_name.c_str());
-        return;
+
+    if (!skyline_plugin_slot_available()) {
+        log("skyline: %s skipped: plugin address range unavailable",
+            plugin_name.c_str());
+        return false;
     }
 
-    uint32_t bucket_count = 0, symbol_count = 0;
-    if (!nro_read(image, hash, bucket_count) ||
-        !nro_read(image, hash + 4, symbol_count) ||
-        symbol_count == 0 ||
-        symbol_count > image.size() / sizeof(NroDynamicSymbol) ||
-        symtab > image.size() ||
-        uint64_t(symbol_count) > (image.size() - symtab) / sizeof(NroDynamicSymbol) ||
-        strtab > image.size() || strsz > image.size() - strtab) {
-        log("skyline: %s: invalid hash, symbol, or string table bounds", plugin_name.c_str());
-        return;
+    if (g_skyline_next_slot >= kSkylinePluginSlotCount) {
+        log("skyline: %s skipped: all four plugin slots are occupied",
+            plugin_name.c_str());
+        return false;
     }
-    (void)bucket_count;
 
-    std::vector<std::string> names(symbol_count);
-    std::vector<uint16_t> sections(symbol_count);
+    const uint64_t base =
+        kSkylinePluginBase + g_skyline_next_slot++ * kSkylinePluginSlotSize;
+
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        log("skyline: %s cannot be opened", plugin_name.c_str());
+        return false;
+    }
+
+    const std::streamoff length = file.tellg();
+    if (length <= 0 || uint64_t(length) > SIZE_MAX) {
+        log("skyline: %s has invalid file size", plugin_name.c_str());
+        return false;
+    }
+
+    std::vector<uint8_t> raw(static_cast<size_t>(length));
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(raw.data()), length);
+    if (!file || file.gcount() != length) {
+        log("skyline: %s read was incomplete", plugin_name.c_str());
+        return false;
+    }
+
+    std::string error;
+    auto nro = nce::parse_nro_bytes(raw, path.string(), error);
+    if (!nro) {
+        log("skyline: %s rejected: %s", plugin_name.c_str(), error.c_str());
+        return false;
+    }
+
+    uint64_t hash = 0, strtab = 0, symtab = 0, strsz = 0;
+    uint64_t rela = 0, relasz = 0, relaent = 0;
+    uint64_t jmprel = 0, pltrelsz = 0, pltrel = 0;
+
+    if (!skyline_parse_dynamic(nro->image, nro->mod0_offset,
+            hash, strtab, symtab, strsz, rela, relasz, relaent,
+            jmprel, pltrelsz, pltrel) ||
+        (pltrelsz && pltrel != 7)) {
+        log("skyline: %s has invalid dynamic metadata", plugin_name.c_str());
+        return false;
+    }
+
+    uint32_t buckets = 0, symbol_count = 0;
+    if (!nro_read(nro->image, hash, buckets) ||
+        !nro_read(nro->image, hash + 4, symbol_count) ||
+        !symbol_count ||
+        symbol_count > nro->image.size() / sizeof(NroDynamicSymbol) ||
+        symtab > nro->image.size() ||
+        uint64_t(symbol_count) >
+            (nro->image.size() - symtab) / sizeof(NroDynamicSymbol) ||
+        strtab > nro->image.size() ||
+        strsz > nro->image.size() - strtab) {
+        log("skyline: %s has invalid symbol table bounds", plugin_name.c_str());
+        return false;
+    }
+    (void)buckets;
+
+    auto plugin = std::make_unique<SkylinePluginRuntime>();
+    plugin->name = plugin_name;
+    plugin->nro = std::move(nro);
+    plugin->base = base;
+
+    const auto& image = plugin->nro->image;
+    plugin->names.resize(symbol_count);
+    plugin->symbols.resize(symbol_count);
 
     for (uint32_t i = 0; i < symbol_count; ++i) {
-        NroDynamicSymbol symbol{};
-        const uint64_t at = symtab + uint64_t(i) * sizeof(symbol);
-
-        if (!nro_read(image, at, symbol)) {
-            log("skyline: %s: truncated dynamic symbol table", plugin_name.c_str());
-            return;
+        NroDynamicSymbol raw_symbol{};
+        if (!nro_read(image, symtab + uint64_t(i) * sizeof(raw_symbol),
+                      raw_symbol)) {
+            log("skyline: %s has a truncated symbol table", plugin_name.c_str());
+            return false;
         }
 
-        sections[i] = symbol.section;
-
-        if (symbol.name >= strsz)
+        if (raw_symbol.name >= strsz)
             continue;
 
-        const char* start = reinterpret_cast<const char*>(image.data() + strtab + symbol.name);
-        const size_t remaining = static_cast<size_t>(strsz - symbol.name);
-        const void* end = std::memchr(start, '\0', remaining);
+        const char* start = reinterpret_cast<const char*>(
+            image.data() + strtab + raw_symbol.name);
+        const size_t remaining = static_cast<size_t>(strsz - raw_symbol.name);
+        const void* end = std::memchr(start, 0, remaining);
         if (!end) {
-            log("skyline: %s: unterminated symbol name at index %u", plugin_name.c_str(), i);
-            return;
+            log("skyline: %s has an unterminated symbol name",
+                plugin_name.c_str());
+            return false;
         }
 
-        names[i].assign(start, static_cast<const char*>(end) - start);
+        plugin->names[i].assign(
+            start, static_cast<const char*>(end) - start);
+
+        plugin->symbols[i] = {
+            plugin->names[i].c_str(),
+            raw_symbol.value,
+            raw_symbol.size,
+            uint8_t(raw_symbol.info & 0x0f),
+            uint8_t(raw_symbol.info >> 4),
+            uint8_t(raw_symbol.section == 0)
+        };
     }
 
-    size_t imports = 0, local = 0, hle = 0, game = 0, unresolved = 0;
+    if (!skyline_load_rela_table(image, rela, relasz, symbol_count,
+                                 plugin->relocs) ||
+        !skyline_load_rela_table(image, jmprel, pltrelsz, symbol_count,
+                                 plugin->relocs)) {
+        log("skyline: %s has invalid relocation tables", plugin_name.c_str());
+        return false;
+    }
 
-    for (uint32_t i = 1; i < symbol_count; ++i) {
-        // SHN_UNDEF means this dynamic symbol is imported.
-        if (sections[i] != 0 || names[i].empty())
+    const uint64_t bss = plugin->nro->data + plugin->nro->data_size;
+    if (plugin->nro->image.size() > kSkylinePluginSlotSize ||
+        bss > kSkylinePluginSlotSize ||
+        plugin->nro->bss_size > kSkylinePluginSlotSize - bss) {
+        log("skyline: %s exceeds its 256 MiB slot", plugin_name.c_str());
+        return false;
+    }
+
+    const uint64_t raw_size = std::max<uint64_t>(
+        plugin->nro->image.size(), bss + plugin->nro->bss_size);
+    const uint64_t mapped_size = (raw_size + 0xffff) & ~uint64_t(0xffff);
+    if (!mapped_size || mapped_size > kSkylinePluginSlotSize ||
+        !commit(base, mapped_size)) {
+        log("skyline: %s mapping allocation failed at %llx",
+            plugin_name.c_str(), (unsigned long long)base);
+        return false;
+    }
+
+    plugin->mapped_size = mapped_size;
+    std::memset(reinterpret_cast<void*>(base), 0, mapped_size);
+    std::memcpy(reinterpret_cast<void*>(base), image.data(), image.size());
+
+    plugin->info.name = plugin->name.c_str();
+    plugin->info.base = base;
+    plugin->info.text = plugin->nro->text;
+    plugin->info.text_size = plugin->nro->text_size;
+    plugin->info.ro = plugin->nro->ro;
+    plugin->info.ro_size = plugin->nro->ro_size;
+    plugin->info.data = plugin->nro->data;
+    plugin->info.data_size = plugin->nro->data_size;
+    plugin->info.bss = bss;
+    plugin->info.bss_size = plugin->nro->bss_size;
+    plugin->info.funcs = nullptr;
+    plugin->info.func_count = 0;
+    plugin->info.relocs = plugin->relocs.data();
+    plugin->info.reloc_count = plugin->relocs.size();
+    plugin->info.symbols = plugin->symbols.data();
+    plugin->info.symbol_count = plugin->symbols.size();
+
+    bool relocation_ok = true;
+    for (const Reloc& r : plugin->relocs) {
+        if (r.type == 0)
             continue;
 
-        ++imports;
-        const char* name = names[i].c_str();
-        const char* source = "UNRESOLVED";
+        if (r.offset > mapped_size ||
+            sizeof(uint64_t) > mapped_size - r.offset) {
+            relocation_ok = false;
+            break;
+        }
 
-        // Resolution priority: plugin-defined symbol, HLE, then main/SDK.
-        bool found_local = false;
-        for (uint32_t j = 1; j < symbol_count; ++j) {
-            if (sections[j] != 0 && names[j] == names[i]) {
-                found_local = true;
+        uint64_t target = 0;
+        if (r.type == R_AARCH64_RELATIVE) {
+            target = base;
+        } else if (r.type == R_AARCH64_ABS64 ||
+                   r.type == R_AARCH64_GLOB_DAT ||
+                   r.type == R_AARCH64_JUMP_SLOT) {
+            if (r.sym >= symbol_count) {
+                relocation_ok = false;
                 break;
             }
-        }
 
-        if (found_local) {
-            source = "PLUGIN";
-            ++local;
-        } else if (hle_lookup(name)) {
-            source = "HLE";
-            ++hle;
-        } else if (module_exports(g_main, name) || module_exports(g_sdk, name)) {
-            source = "MAIN/SDK";
-            ++game;
-        } else {
-            ++unresolved;
-        }
+            const Symbol& sym = plugin->symbols[r.sym];
+            const char* name = plugin->names[r.sym].c_str();
 
-        log("skyline: import[%u] %s -> %s", i, name, source);
-    }
-
-
-    // Count AArch64 Elf64_Rela relocation types without applying them.
-    auto relocation_name = [](uint32_t type) -> const char* {
-        switch (type) {
-            case 0: return "NONE";
-            case 257: return "ABS64";
-            case 258: return "ABS32";
-            case 259: return "ABS16";
-            case 260: return "PREL64";
-            case 261: return "PREL32";
-            case 262: return "PREL16";
-            case 275: return "ADR_PREL_PG_HI21";
-            case 277: return "ADD_ABS_LO12_NC";
-            case 282: return "JUMP26";
-            case 283: return "CALL26";
-            case 1024: return "COPY";
-            case 1025: return "GLOB_DAT";
-            case 1026: return "JUMP_SLOT";
-            case 1027: return "RELATIVE";
-            case 1028: return "TLS_DTPREL";
-            case 1029: return "TLS_DTPMOD";
-            case 1030: return "TLS_TPREL";
-            case 1031: return "TLSDESC";
-            case 1032: return "IRELATIVE";
-            default: return "OTHER";
-        }
-    };
-    auto report_relocations = [&](const char* table_name,
-                                  uint64_t offset, uint64_t size,
-                                  uint64_t entry_size) {
-        constexpr uint64_t kRelaSize = 24;
-
-        if (size == 0) {
-            log("skyline: %s relocations: 0", table_name);
-            return;
-        }
-
-        if (!offset || entry_size != kRelaSize ||
-            size % kRelaSize != 0 ||
-            offset > image.size() || size > image.size() - offset) {
-            log("skyline: %s relocations: invalid table bounds/entry size",
-                table_name);
-            return;
-        }
-
-        std::vector<std::pair<uint32_t, size_t>> counts;
-        const uint64_t total = size / kRelaSize;
-
-        for (uint64_t i = 0; i < total; ++i) {
-            uint64_t info = 0;
-            const uint64_t at = offset + i * kRelaSize + 8;
-
-            if (!nro_read(image, at, info)) {
-                log("skyline: %s relocations: truncated entry %llu",
-                    table_name, static_cast<unsigned long long>(i));
-                return;
+            if (!sym.imported) {
+                target = base + sym.value;
+            } else if (name[0] &&
+                       std::strcmp(name, "__nro_header_start") == 0) {
+                target = base;
+            } else if (name[0]) {
+                for (uint32_t j = 1; j < symbol_count && !target; ++j) {
+                    const Symbol& local = plugin->symbols[j];
+                    if (!local.imported && local.bind != 0 &&
+                        plugin->names[j] == name)
+                        target = base + local.value;
+                }
+                if (!target && hle_lookup(name))
+                    target = hle_address(name);
+                if (!target)
+                    target = skyline_module_symbol(g_main, name);
+                if (!target)
+                    target = skyline_module_symbol(g_sdk, name);
             }
 
-            const uint32_t type = static_cast<uint32_t>(info);
-            auto it = std::find_if(counts.begin(), counts.end(),
-                [type](const auto& item) { return item.first == type; });
-
-            if (it == counts.end())
-                counts.emplace_back(type, 1);
-            else
-                ++it->second;
+            if (!target) {
+                log("skyline: %s unresolved relocation symbol %s",
+                    plugin_name.c_str(), name);
+                relocation_ok = false;
+                break;
+            }
+        } else {
+            log("skyline: %s unsupported relocation type %u",
+                plugin_name.c_str(), r.type);
+            relocation_ok = false;
+            break;
         }
 
-        log("skyline: %s relocations: %llu entries",
-            table_name, static_cast<unsigned long long>(total));
-
-        for (const auto& item : counts) {
-            log("skyline:   type %u (%s): %zu",
-                item.first, relocation_name(item.first), item.second);
-        }
-    };
-
-    report_relocations("DT_RELA", rela, relasz, relaent);
-
-    if (pltrel == DT_RELA) {
-        report_relocations("DT_JMPREL", jmprel, pltrelsz, relaent);
-    } else if (pltrelsz != 0) {
-        log("skyline: DT_JMPREL uses unsupported relocation format %llu",
-            static_cast<unsigned long long>(pltrel));
-    } else {
-        log("skyline: DT_JMPREL relocations: 0");
+        const uint64_t value = target + uint64_t(r.addend);
+        std::memcpy(reinterpret_cast<void*>(base + r.offset),
+                    &value, sizeof(value));
     }
 
-    log("skyline: %s dry-run: %zu imports; plugin=%zu HLE=%zu main/sdk=%zu unresolved=%zu",
-        plugin_name.c_str(), imports, local, hle, game, unresolved);
+    if (!relocation_ok) {
+        decommit(base, mapped_size);
+        vm_set(base, mapped_size, kMemFree, 0);
+        log("skyline: %s skipped: relocation failed", plugin_name.c_str());
+        return false;
+    }
+
+    if (plugin->info.text_size)
+        vm_set(base + plugin->info.text, plugin->info.text_size, kMemCode, 5);
+    if (plugin->info.ro_size)
+        vm_set(base + plugin->info.ro, plugin->info.ro_size, kMemCode, 1);
+    const uint64_t data_extent =
+        plugin->info.data_size + plugin->info.bss_size;
+    if (data_extent)
+        vm_set(base + plugin->info.data, data_extent, kMemCodeData, 3);
+
+    LoadedModule loaded{&plugin->info, base, mapped_size, nullptr};
+    if (!nce::prepare_module_optional(loaded)) {
+        decommit(base, mapped_size);
+        vm_set(base, mapped_size, kMemFree, 0);
+        log("skyline: %s skipped: NCE preparation failed",
+            plugin_name.c_str());
+        return false;
+    }
+
+    log("skyline: %s mapped at %llx (+%llx), %zu symbols, %zu relocations; "
+        "NCE prepared; execution disabled",
+        plugin_name.c_str(),
+        (unsigned long long)base,
+        (unsigned long long)mapped_size,
+        plugin->symbols.size(),
+        plugin->relocs.size());
+
+    g_skyline_plugins.push_back(std::move(plugin));
+    return true;
+}
+
+static void inspect_skyline_nro(const std::filesystem::path& path) {
+    (void)load_skyline_nro(path);
 }
 
 }  // namespace

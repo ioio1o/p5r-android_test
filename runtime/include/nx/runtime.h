@@ -59,6 +59,7 @@ constexpr uint64_t kKernelBase = 0x6A00000000ull;
 
 void memory_init();
 bool commit(uint64_t addr, uint64_t size);   // make [addr, addr+size) read/write
+bool skyline_plugin_slot_available();
 void decommit(uint64_t addr, uint64_t size);
 uint64_t kernel_alloc(uint64_t size, uint64_t align = 0x1000);  // from the kernel region
 

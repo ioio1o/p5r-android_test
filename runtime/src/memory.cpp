@@ -12,6 +12,7 @@ namespace nx {
 namespace {
 
 std::mutex g_vm_lock;
+bool g_skyline_plugin_slot_available = false;
 std::map<uint64_t, VmInfo> g_vm;  // start -> block (non-overlapping; gaps are free)
 uint64_t g_kernel_next = kKernelBase;
 
@@ -23,8 +24,17 @@ void reserve(uint64_t addr, uint64_t size, const char* what) {
 
 }  // namespace
 
+bool skyline_plugin_slot_available() {
+    return g_skyline_plugin_slot_available;
+}
+
+
 void memory_init() {
     reserve(kModuleBase, 0x20000000, "modules");
+    g_skyline_plugin_slot_available =
+        plat::reserve(0x4030000000ull, 0x40000000ull);
+    if (!g_skyline_plugin_slot_available)
+        log("skyline: four-slot plugin address range unavailable; plugins disabled");
     reserve(kHeapBase, kHeapMax, "heap");
     reserve(kAliasBase, kAliasSize, "alias");
     reserve(kStackBase, kStackSize, "stack");
