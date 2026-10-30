@@ -40,6 +40,8 @@ void enter(CPU& c, uint64_t target);
 // where the original function can still be called with call() (its first instruction moved, then a branch back),
 // 0 if the function's first instruction cannot be moved.
 uint64_t hook(uint64_t addr, HleFn fn);
+// Installs an inline hook for a single displaced AArch64 BL instruction.
+uint64_t hook_inline(uint64_t addr, HleFn fn);
 
 // The Switch's 19.2 MHz system tick, from the host's virtual counter (what the patched mrs CNTPCT_EL0 returns).
 uint64_t tick();

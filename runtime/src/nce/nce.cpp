@@ -709,19 +709,25 @@ void enter(CPU& c, uint64_t target) {
     b->ctx = prev;
 }
 
+
 uint64_t hook(uint64_t addr, HleFn fn) {
     std::lock_guard lk(g_regions_lock);
     const LoadedModule* m = module_at(addr);
     auto it = m ? g_regions.find(m->base) : g_regions.end();
-    if (it == g_regions.end() || addr - (m->base + m->info->text) >= m->info->text_size) {
-        log("nce: hook at %llx: not in a module's code", (unsigned long long)addr);
+    if (it == g_regions.end() ||
+        addr - (m->base + m->info->text) >= m->info->text_size) {
+        log("nce: hook at %llx: not in a module's code",
+            (unsigned long long)addr);
         return 0;
     }
+
     const uint32_t first = ld<uint32_t>(addr);
     if (pc_relative(first)) {
-        log("nce: hook at %s: its first instruction %08x depends on its address", describe(addr).c_str(), first);
+        log("nce: hook at %s: its first instruction %08x depends on its address",
+            describe(addr).c_str(), first);
         return 0;
     }
+
     const uint32_t index = g_hook_count.load();
     if (index >= kMaxHooks) return 0;
     g_hooks[index] = fn;
@@ -729,20 +735,118 @@ uint64_t hook(uint64_t addr, HleFn fn) {
 
     Region& r = it->second;
     const uint64_t from = r.cur;
-    if (!protect(r.base, kRegionSize, PROT_READ | PROT_WRITE | PROT_EXEC)) protect(r.base, kRegionSize, PROT_READ | PROT_WRITE);
+    if (!protect(r.base, kRegionSize, PROT_READ | PROT_WRITE | PROT_EXEC))
+        protect(r.base, kRegionSize, PROT_READ | PROT_WRITE);
+
     const uint64_t original = r.emit(first);
     r.emit(b_to(r.cur, addr + 4));
     const uint64_t stub = r.emit(kPushX16X17);
     r.emit(movz_w16(index));
     r.emit(movk_w16_hi(0x4000));
     r.emit(b_to(r.cur, r.common));
+
     protect(r.base, kRegionSize, PROT_READ | PROT_EXEC);
     clear_cache(from, r.cur - from);
+
     const uint32_t branch = b_to(addr, stub);
     write_code(addr, &branch, 4);
     return original;
 }
 
+uint64_t hook_inline(uint64_t addr, HleFn fn) {
+    std::lock_guard lk(g_regions_lock);
+    const LoadedModule* m = module_at(addr);
+    auto it = m ? g_regions.find(m->base) : g_regions.end();
+
+    if (!fn || it == g_regions.end() ||
+        addr < m->base + m->info->text ||
+        addr - (m->base + m->info->text) >= m->info->text_size) {
+        log("nce: inline hook at %llx: not in a module's code",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    const uint32_t first = ld<uint32_t>(addr);
+    if ((first & 0xFC000000u) != 0x94000000u) {
+        log("nce: inline hook at %llx: expected BL immediate, found %08x",
+            (unsigned long long)addr, first);
+        return 0;
+    }
+
+    int64_t imm26 = static_cast<int64_t>(first & 0x03FFFFFFu);
+    if (imm26 & (int64_t(1) << 25))
+        imm26 -= int64_t(1) << 26;
+    const uint64_t destination = static_cast<uint64_t>(
+        static_cast<int64_t>(addr) + imm26 * 4
+    );
+
+    const uint32_t index = g_hook_count.load();
+    if (index >= kMaxHooks) {
+        log("nce: inline hook at %llx: hook table full",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    Region& r = it->second;
+    const uint64_t from = r.cur;
+    constexpr uint64_t kInlineTrampolineBytes = 6 * sizeof(uint32_t);
+    if (r.failed || r.cur > r.end ||
+        r.end - r.cur < kInlineTrampolineBytes) {
+        log("nce: inline hook at %llx: insufficient stub region space",
+            (unsigned long long)addr);
+        return 0;
+    }
+if (!protect(r.base, kRegionSize, PROT_READ | PROT_WRITE | PROT_EXEC))
+        protect(r.base, kRegionSize, PROT_READ | PROT_WRITE);
+
+    // The HLE stub returns through x30. The callback sets x30 to the
+    // relocated BL, which then returns here before branching to addr+4.
+    const uint64_t stub = r.emit(kPushX16X17);
+    r.emit(movz_w16(index));
+    r.emit(movk_w16_hi(0x4000));
+    r.emit(b_to(r.cur, r.common));
+
+    const uint64_t continuation = r.cur;
+    const int64_t displacement =
+        static_cast<int64_t>(destination) - static_cast<int64_t>(continuation);
+
+    if ((displacement & 3) ||
+        displacement < -(int64_t(1) << 27) ||
+        displacement >= (int64_t(1) << 27)) {
+        r.cur = from;
+        protect(r.base, kRegionSize, PROT_READ | PROT_EXEC);
+        log("nce: inline hook at %llx: relocated BL destination %llx is out of range",
+            (unsigned long long)addr,
+            (unsigned long long)destination);
+        return 0;
+    }
+
+    const uint32_t relocated_bl =
+        0x94000000u |
+        (static_cast<uint32_t>(displacement >> 2) & 0x03FFFFFFu);
+
+    r.emit(relocated_bl);
+    r.emit(b_to(r.cur, addr + 4));
+
+
+    g_hooks[index] = fn;
+    g_hook_count.store(index + 1);
+
+    protect(r.base, kRegionSize, PROT_READ | PROT_EXEC);
+    clear_cache(from, r.cur - from);
+
+    const uint32_t branch = b_to(addr, stub);
+    write_code(addr, &branch, 4);
+
+    log("nce: inline BL hook at %llx -> stub %llx, relocated BL %llx -> %llx, return %llx",
+        (unsigned long long)addr,
+        (unsigned long long)stub,
+        (unsigned long long)continuation,
+        (unsigned long long)destination,
+        (unsigned long long)(addr + 4));
+
+    return continuation;
+}
 uint64_t tick() { return scaled(cntvct()) - g_tick_off; }
 
 bool guest_fault_context(void* ucontext, CPU& c, uint64_t& pc) {

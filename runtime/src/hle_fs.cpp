@@ -122,15 +122,36 @@ std::string utf8(const fs::path& p) {
 std::string cstr(uint64_t p) { return p ? std::string(reinterpret_cast<const char*>(p)) : std::string(); }
 
 // "mount:/a/b" -> host path; empty when the mount is unknown.
+
 fs::path resolve(const std::string& guest) {
     auto colon = guest.find(':');
     if (colon == std::string::npos) return {};
-    auto it = g_mounts.find(guest.substr(0, colon));
+
+    const std::string mount_name = guest.substr(0, colon);
+    auto it = g_mounts.find(mount_name);
+
+    if (it == g_mounts.end() && mount_name == "sd") {
+        const fs::path sd_root = data_root() / "sdmc";
+        std::error_code ec;
+        fs::create_directories(sd_root, ec);
+        if (ec) {
+            log("fs: cannot create sd: root %s: %s",
+                sd_root.string().c_str(), ec.message().c_str());
+            return {};
+        }
+        it = g_mounts.emplace("sd", sd_root).first;
+        log("fs: mounted sd: -> %s", sd_root.string().c_str());
+    }
+
     if (it == g_mounts.end()) return {};
+
     std::string rest = guest.substr(colon + 1);
-    while (!rest.empty() && (rest[0] == '/' || rest[0] == '\\')) rest.erase(0, 1);
+    while (!rest.empty() && (rest[0] == '/' || rest[0] == '\\'))
+        rest.erase(0, 1);
+
     return it->second / fs::u8path(rest);
 }
+
 
 void mount(const std::string& name, const fs::path& p) {
     fs::create_directories(p);

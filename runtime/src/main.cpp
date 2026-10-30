@@ -317,36 +317,31 @@ static void skyline_get_region(CPU& c) {
     );
 }
 
+
 static void skyline_tcp_send_raw(CPU& c) {
     static uint64_t sequence = 0;
     const uint64_t address = c.x[0];
+    const uint64_t requested_length = c.x[1];
     const uint64_t write_sequence = ++sequence;
+    constexpr size_t kMaxLogBytes = 1024;
 
-    if (!guest_range_ok(address, 1, 1)) {
-        log("skyline: TCP write #%llu buffer=%llx length=unreadable",
+    const size_t count = static_cast<size_t>(
+        std::min<uint64_t>(requested_length, kMaxLogBytes)
+    );
+
+    if (count && !guest_range_ok(address, count, 1)) {
+        log("skyline: TCP write #%llu buffer=%llx length=%llu unreadable",
             (unsigned long long)write_sequence,
-            (unsigned long long)address);
+            (unsigned long long)address,
+            (unsigned long long)requested_length);
         return;
     }
 
-    char raw[1024];
-    size_t count = 0;
+    char raw[kMaxLogBytes]{};
+    if (count)
+        std::memcpy(raw, reinterpret_cast<const void*>(address), count);
 
-    for (; count < sizeof(raw); ++count) {
-        if (address > UINT64_MAX - count ||
-            !guest_range_ok(address + count, 1, 1)) {
-            break;
-        }
-
-        const char ch =
-            *reinterpret_cast<const char*>(address + count);
-        if (!ch)
-            break;
-        raw[count] = ch;
-    }
-
-    const size_t write_length = count;
-    const size_t preview_count = std::min<size_t>(write_length, 48);
+    const size_t preview_count = std::min<size_t>(count, 48);
     char hex[48 * 3 + 1]{};
     char ascii[49]{};
 
@@ -361,31 +356,33 @@ static void skyline_tcp_send_raw(CPU& c) {
             ? static_cast<char>(ch) : '.';
     }
 
-    log("skyline: TCP write #%llu buffer=%llx length=%zu "
-        "preview_hex=[%s] preview_ascii=\"%s\"",
+    log("skyline: TCP write #%llu buffer=%llx length=%llu read=%zu "
+        "preview_hex=[%s] preview_ascii=\"%s\"%s",
         (unsigned long long)write_sequence,
         (unsigned long long)address,
-        write_length, hex, ascii);
+        (unsigned long long)requested_length,
+        count, hex, ascii,
+        requested_length > kMaxLogBytes ? " (truncated at 1024 bytes)" : "");
 
-    while (count &&
-           (raw[count - 1] == '\n' || raw[count - 1] == '\r')) {
-        --count;
+    size_t printable_count = count;
+    while (printable_count &&
+           (raw[printable_count - 1] == '
+' ||
+            raw[printable_count - 1] == '
+')) {
+        --printable_count;
     }
 
     std::string sanitized;
-    sanitized.reserve(count);
-
-    for (size_t i = 0; i < count; ++i) {
+    sanitized.reserve(printable_count);
+    for (size_t i = 0; i < printable_count; ++i) {
         const unsigned char ch = static_cast<unsigned char>(raw[i]);
         sanitized.push_back(
-            ch >= 0x20 && ch <= 0x7e
-                ? static_cast<char>(ch)
-                : '.'
+            ch >= 0x20 && ch <= 0x7e ? static_cast<char>(ch) : '.'
         );
     }
     log("plugin: %s", sanitized.c_str());
 }
-
 static void skyline_a64_hook_function(CPU& c) {
         ++g_skyline_function_hook_requests;
 const uint64_t target = c.x[0];
@@ -418,18 +415,108 @@ const uint64_t target = c.x[0];
     }
 }
 
+
+static uint64_t g_skyline_inline_replacement = 0;
+static uint64_t g_skyline_inline_continuation = 0;
+static uint64_t g_skyline_inline_context = 0;
+
+static void skyline_inline_hook_callback(CPU& c) {
+    const uint64_t continuation = g_skyline_inline_continuation;
+    const uint64_t replacement = g_skyline_inline_replacement;
+
+if (!replacement || !continuation) {
+    if (continuation)
+        c.x[30] = continuation;
+    log("skyline: inline callback skipped: replacement or continuation missing");
+    return;
+}
+
+    constexpr size_t kInlineRegisterCount = 31;
+    constexpr size_t kInlineContextSize = kInlineRegisterCount * sizeof(uint64_t);
+
+    if (!g_skyline_inline_context)
+        g_skyline_inline_context = kernel_alloc(kInlineContextSize, 16);
+
+    const uint64_t context = g_skyline_inline_context;
+    if (!context || !guest_range_ok(context, kInlineContextSize, 3)) {
+        c.x[30] = continuation;
+        log("skyline: inline callback skipped: invalid InlineCtx memory=%llx",
+            (unsigned long long)context);
+        return;
+    }
+
+    std::memcpy(
+        reinterpret_cast<void*>(context),
+        c.x,
+        kInlineContextSize
+    );
+
+    log("skyline: inline callback begin replacement=%llx context=%llx",
+        (unsigned long long)replacement,
+        (unsigned long long)context);
+
+    CPU plugin_call = c;
+    plugin_call.x[0] = context;
+    nce::enter(plugin_call, replacement);
+
+    std::memcpy(
+        c.x,
+        reinterpret_cast<const void*>(context),
+        kInlineContextSize
+    );
+
+    // The original BL executes next, from its relocated trampoline address.
+    c.x[30] = continuation;
+
+    log("skyline: inline callback returned replacement=%llx; "
+        "restored x0-x30; resume relocated BL=%llx",
+        (unsigned long long)replacement,
+        (unsigned long long)continuation);
+}
+
 static void skyline_a64_inline_hook(CPU& c) {
-        ++g_skyline_inline_hook_requests;
-const uint64_t target = c.x[0];
+    ++g_skyline_inline_hook_requests;
+    const uint64_t target = c.x[0];
     const uint64_t replacement = c.x[1];
 
     skyline_log_hook_target("A64InlineHook", target);
 
-    log("skyline: A64InlineHook no-op target=%llx replacement=%llx; "
+    if (g_main && target == g_main->base + 0x102603c) {
+        log("skyline: A64InlineHook skip known BLR site target=%llx replacement=%llx",
+            (unsigned long long)target,
+            (unsigned long long)replacement);
+        return;
+    }
+
+    if (g_main && target == g_main->base + 0x8a9134) {
+        if (!replacement || g_skyline_inline_continuation) {
+            log("skyline: A64InlineHook refused target=%llx: invalid replacement or already installed",
+                (unsigned long long)target);
+            return;
+        }
+
+        g_skyline_inline_replacement = replacement;
+        g_skyline_inline_continuation =
+            nce::hook_inline(target, skyline_inline_hook_callback);
+
+        if (g_skyline_inline_continuation) {
+            log("skyline: A64InlineHook installed BL trampoline target=%llx "
+                "replacement=%llx continuation=%llx",
+                (unsigned long long)target,
+                (unsigned long long)replacement,
+                (unsigned long long)g_skyline_inline_continuation);
+        } else {
+            g_skyline_inline_replacement = 0;
+            log("skyline: A64InlineHook failed to install BL trampoline target=%llx",
+                (unsigned long long)target);
+        }
+        return;
+    }
+
+    log("skyline: A64InlineHook no-op unsupported target=%llx replacement=%llx; "
         "guest code unchanged",
         (unsigned long long)target,
-        (unsigned long long)replacement
-    );
+        (unsigned long long)replacement);
 }
 
 NX_HLE("getRegionAddress", skyline_get_region);
