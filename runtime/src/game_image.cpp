@@ -82,6 +82,11 @@ const nxi::GameImage* game_image() {
     return g_image.get();
 }
 
+std::string game_display_version() {
+    const auto* image = game_image();
+    return image ? image->display_version() : std::string{};
+}
+
 std::string game_image_path(const std::string& path) {
     std::string out, part;
     auto flush = [&] {

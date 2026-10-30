@@ -2,10 +2,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <cstring>
+#include <string>
 
 #include "ipc.h"
 #include "language.h"
 #include "users.h"
+#include "game_image.h"
 
 namespace nx {
 
@@ -223,6 +226,21 @@ std::shared_ptr<Service> library_applet_creator() {
 
 std::shared_ptr<Service> application_functions() {
     return svc("IApplicationFunctions", [](Service& s) {
+        s.cmds[23] = [](IpcCtx& c) {  // GetDisplayVersion
+            char version[0x10]{};
+            const std::string value = game_display_version();
+
+            const size_t count =
+                value.size() < sizeof(version) ? value.size() : sizeof(version);
+
+            if (count)
+                std::memcpy(version, value.data(), count);
+
+            c.out.insert(c.out.end(), version, version + sizeof(version));
+            log("am: GetDisplayVersion -> %.*s",
+                static_cast<int>(sizeof(version)), version);
+            return 0u;
+        };
         s.cmds[1] = [](IpcCtx& c) {  // PopLaunchParameter(kind): the preselected user, once
             static bool popped = false;
             if (c.arg<uint32_t>(0) != 2 || popped) return 0x2A80u;

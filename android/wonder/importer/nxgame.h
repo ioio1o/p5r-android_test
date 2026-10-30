@@ -28,6 +28,8 @@ public:
     ~GameImage();
 
     uint64_t title_id() const;
+    // Display version from the base game's Control NCA (control.nacp).
+    std::string display_version() const;
     // The ExeFS files ("main", "sdk", "subsdk0", "main.npdm", ...), checked against the NCA's hash table.
     const std::map<std::string, std::vector<uint8_t>>& exefs() const;
     // RomFS paths are '/'-separated with no leading slash ("CPK/ALL_USEU.CPK"); "" is the root. As dumped (case kept).

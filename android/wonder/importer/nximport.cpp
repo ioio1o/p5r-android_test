@@ -1480,6 +1480,7 @@ struct GameImage::Impl {
     std::unique_ptr<Nca> base;
     std::unique_ptr<Nca> patch;
     uint64_t title = 0;
+    std::string version;
     std::map<std::string, std::vector<uint8_t>> exefs;
     // Effective RomFS storage: base RomFS or the update's patched view.
     Storage* romfs_storage = nullptr;
@@ -1497,6 +1498,9 @@ struct GameImage::Impl {
 GameImage::GameImage() : impl_(std::make_unique<Impl>()) {}
 GameImage::~GameImage() = default;
 uint64_t GameImage::title_id() const { return impl_->title; }
+std::string GameImage::display_version() const {
+    return impl_->version;
+}
 const std::map<std::string, std::vector<uint8_t>>& GameImage::exefs() const { return impl_->exefs; }
 size_t GameImage::file_count() const {
     size_t n = 0;
@@ -1584,12 +1588,21 @@ std::unique_ptr<GameImage> GameImage::open(const std::vector<InputFile>& inputs,
             }
         }
         std::vector<std::unique_ptr<Nca>> programs;
+        std::vector<std::unique_ptr<Nca>> controls;
+
         for (const Ent& e : ents) {
             std::string n = lower(e.name);
-            if (ends_with(n, ".ncz")) fail("%s: compressed NCZ content is not supported; use an uncompressed NSP/XCI", e.name.c_str());
-            if (!ends_with(n, ".nca")) continue;
+            if (ends_with(n, ".ncz"))
+                fail("%s: compressed NCZ content is not supported; use an uncompressed NSP/XCI",
+                     e.name.c_str());
+            if (!ends_with(n, ".nca"))
+                continue;
+
             auto nca = open_nca(e.st, e.off, e.size, e.name, keys, hk, tickets);
-            if (nca && nca->content_type == 0) programs.push_back(std::move(nca));
+            if (nca && nca->content_type == 0)
+                programs.push_back(std::move(nca));
+            else if (nca && nca->content_type == 2)
+                controls.push_back(std::move(nca));
         }
         secure_zero(hk, sizeof hk);
         uint64_t app = title_id & ~0xFFFull;
@@ -1621,6 +1634,69 @@ std::unique_ptr<GameImage> GameImage::open(const std::vector<InputFile>& inputs,
         Nca& b = *im.base;
         if (!b.key_ok) fail("%s: %s", b.name.c_str(), b.key_problem.c_str());
         im.title = b.title_id;
+
+        // NACP DisplayVersion is a 16-byte field at offset 0x3060.
+        // This is optional metadata; failure must not prevent game startup.
+        for (auto& control : controls) {
+            if (!control || !control->key_ok ||
+                (control->title_id & ~0xFFFull) !=
+                    (im.title & ~0xFFFull))
+                continue;
+
+            for (int i = 0; i < 4 && im.version.empty(); ++i) {
+                Section& section = control->sec[i];
+
+                if (!section.present || section.partition() != 1)
+                    continue;
+
+                if (section.crypt() != 1 &&
+                    section.crypt() != 3 &&
+                    section.crypt() != 4)
+                    continue;
+
+                try {
+                    Storage* pfs = plain_section(*control, i);
+                    const auto entries = read_pfs(
+                        pfs, 0, false, control->name + "/Control");
+
+                    for (const ContEntry& entry : entries) {
+                        if (lower(entry.name) != "control.nacp")
+                            continue;
+
+                        if (entry.size < 0x3070 ||
+                            entry.off > pfs->size ||
+                            entry.size > pfs->size - entry.off ||
+                            0x3070 > entry.size)
+                            continue;
+
+                        uint8_t raw[16]{};
+                        pfs->read(entry.off + 0x3060, raw, sizeof(raw));
+
+                        size_t length = 0;
+                        bool valid = true;
+
+                        while (length < sizeof(raw) && raw[length] != 0) {
+                            if (raw[length] < 0x20 || raw[length] > 0x7e)
+                                valid = false;
+                            ++length;
+                        }
+
+                        if (valid && length != 0) {
+                            im.version.assign(
+                                reinterpret_cast<const char*>(raw), length);
+                        }
+                        break;
+                    }
+                } catch (const std::exception&) {
+                    // Invalid or unavailable Control metadata is nonfatal.
+                }
+            }
+
+            if (!im.version.empty())
+                break;
+        }
+
+
 
         // ExeFS, checked block by block against its hash table (as the import does)
         Nca* exe_nca = im.patch ? im.patch.get() : &b;

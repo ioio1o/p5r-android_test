@@ -15,6 +15,9 @@ namespace nx {
 // The image, opened on first use; null when no game file is configured. A configured file that does not open is fatal.
 const nxi::GameImage* game_image();
 
+// Display version from the loaded game's Control NCA.
+std::string game_display_version();
+
 // A RomFS path for the image: '/'-separated, no leading or doubled slashes, "." parts dropped.
 std::string game_image_path(const std::string& path);
 
