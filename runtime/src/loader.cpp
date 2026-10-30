@@ -272,6 +272,8 @@ void load_modules(const ModuleInfo* const* mods, size_t count, const std::string
     // This lets a failed optional module disappear without affecting main/sdk.
     if (has_optional) {
         const ModuleInfo* mi = mods[optional_index];
+        if (!mi) fatal("module loader: optional module descriptor at index %zu is null",
+                       optional_index);
 
         // NCE preparation makes optional text RX before relocation.
         // Skip the optional module if any relocation would write into text.
@@ -389,6 +391,7 @@ void load_modules(const ModuleInfo* const* mods, size_t count, const std::string
         }
 #endif
         const ModuleInfo* mi = mods[i];
+        if (!mi) fatal("module loader: module descriptor at index %zu is null", i);
         const uint64_t image = mi->data + mi->data_size;
         const uint64_t size = ((mi->bss + mi->bss_size) + 0xFFF) & ~0xFFFull;
         if (!commit(mi->base, size)) fatal("cannot commit module %s", mi->name);

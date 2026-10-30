@@ -230,9 +230,9 @@ void boot() {
         selected_subsdk9 = mod_dirs.back() / "exefs" / "subsdk9";
 
     size_t module_count = 2;
-    const ModuleInfo* mods[3] = {g_main, nullptr, g_sdk};
+    const ModuleInfo* mods[3] = {g_main, g_sdk, nullptr};
     const uint8_t* images[3] = {
-        nso[0]->image.data(), nullptr, nso[1]->image.data()
+        nso[0]->image.data(), nso[1]->image.data(), nullptr
     };
     size_t optional_index = static_cast<size_t>(-1);
 
@@ -299,6 +299,8 @@ void boot() {
 
                 mods[1] = &nso[2]->info;
                 images[1] = nso[2]->image.data();
+                mods[2] = g_sdk;
+                images[2] = nso[1]->image.data();
                 module_count = 3;
                 optional_index = 1;
             }
