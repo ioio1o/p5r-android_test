@@ -566,7 +566,12 @@ void init() {
         st<uint32_t>(a + 8, b_to(a + 8, r.common));
         st<uint32_t>(a + 12, 0xD4200000);  // brk #0
     }
-    if (!protect(kThunkBase, kThunkSize + kThunkExtra, PROT_READ | static bool prepare_module_impl(const LoadedModule& m, bool optional) {
+    if (!protect(kThunkBase, kThunkSize + kThunkExtra, PROT_READ | PROT_EXEC))
+        fatal("nce: this system does not let the app run code it loaded (mprotect PROT_EXEC failed)");
+    clear_cache(kThunkBase, kThunkSize + kThunkExtra);
+}
+
+static bool prepare_module_impl(const LoadedModule& m, bool optional) {
     const ModuleInfo* mi = m.info;
     Region r;
     r.safe = optional;
@@ -687,13 +692,6 @@ void prepare_module(const LoadedModule& m) {
 
 bool prepare_module_optional(const LoadedModule& m) {
     return prepare_module_impl(m, true);
-} does not let the app run code it loaded (mprotect PROT_EXEC failed)");
-    clear_cache(text, mi->text_size);
-    clear_cache(r.base, r.cur - r.base);
-    log("nce: %s ready: %zu svc, %zu TLS and %zu counter sites patched, stubs %llu bytes", mi->name, svcs, tls,
-        counters, (unsigned long long)(r.cur - r.base));
-    std::lock_guard lk(g_regions_lock);
-    g_regions[m.base] = r;
 }
 
 void enter(CPU& c, uint64_t target) {
