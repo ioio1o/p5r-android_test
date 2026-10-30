@@ -353,7 +353,7 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
         g_files[h] = std::make_shared<File>(f, guest);
         st<uint64_t>(c.x[0], h);
         note_open("OpenFile", guest, "virtual");
-        if (trace_fs()) log("fs: OpenFile(%s) -> virtual, %zu bytes", guest.c_str(), v->size());
+        if (trace_fs() || guest.rfind("sd:", 0) == 0) log("fs: OpenFile(%s) -> virtual, %zu bytes", guest.c_str(), v->size());
         c.x[0] = kOk;
         return;
     }
@@ -372,7 +372,7 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
         const nxi::GameImage::Entry* e = game_image()->find(rel);
         if (!e || e->dir) {
             note_open("OpenFile", guest, "not in the game file");
-            if (trace_fs()) log("fs: OpenFile(%s) not found in the game file", guest.c_str());
+            if (trace_fs() || guest.rfind("sd:", 0) == 0) log("fs: OpenFile(%s) not found in the game file", guest.c_str());
             c.x[0] = kPathNotFound;
             return;
         }
@@ -380,21 +380,21 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
         g_files[h] = std::make_shared<File>(e, guest);
         st<uint64_t>(c.x[0], h);
         note_open("OpenFile", guest, "ok (game file)");
-        if (trace_fs()) log("fs: OpenFile(%s, %d) -> %llu (game file)", guest.c_str(), mode, (unsigned long long)h);
+        if (trace_fs() || guest.rfind("sd:", 0) == 0) log("fs: OpenFile(%s, %d) -> %llu (game file)", guest.c_str(), mode, (unsigned long long)h);
         c.x[0] = kOk;
         return;
     }
     std::error_code ec;
     if (p.empty() || !fs::is_regular_file(p, ec)) {
         note_open("OpenFile", guest, p.empty() ? "unknown mount" : "not found");
-        if (trace_fs()) log("fs: OpenFile(%s) not found", guest.c_str());
+        if (trace_fs() || guest.rfind("sd:", 0) == 0) log("fs: OpenFile(%s) not found", guest.c_str());
         c.x[0] = kPathNotFound;
         return;
     }
     FILE* f = plat::fopen_utf8(utf8(p), (mode & 2) ? "r+b" : "rb");
     if (!f) {
         note_open("OpenFile", guest, "the host could not open it");
-        if (trace_fs()) log("fs: OpenFile(%s) failed to open on the host (errno %d)", guest.c_str(), errno);
+        if (trace_fs() || guest.rfind("sd:", 0) == 0) log("fs: OpenFile(%s) failed to open on the host (errno %d)", guest.c_str(), errno);
         c.x[0] = kPathNotFound;
         return;
     }
@@ -402,7 +402,7 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
     g_files[h] = std::make_shared<File>(f, guest);
     st<uint64_t>(c.x[0], h);
     note_open("OpenFile", guest, "ok");
-    if (trace_fs()) log("fs: OpenFile(%s, %d) -> %llu", guest.c_str(), mode, (unsigned long long)h);
+    if (trace_fs() || guest.rfind("sd:", 0) == 0) log("fs: OpenFile(%s, %d) -> %llu", guest.c_str(), mode, (unsigned long long)h);
     c.x[0] = kOk;
 }
 
@@ -433,7 +433,7 @@ void GetFileSize(CPU& c) {  // (s64* out, FileHandle)
     int64_t cur = plat::ftell64(f);
     plat::fseek64(f, 0, SEEK_END);
     st<int64_t>(c.x[0], plat::ftell64(f));
-    if (g_trace) log("fs: size %s = %lld", file->path.c_str(), (long long)ld<int64_t>(c.x[0]));
+    if (g_trace || file->path.rfind("sd:", 0) == 0) log("fs: size %s = %lld", file->path.c_str(), (long long)ld<int64_t>(c.x[0]));
     plat::fseek64(f, cur, SEEK_SET);
     c.x[0] = kOk;
 }
@@ -443,7 +443,7 @@ uint64_t read_at(const File& file, int64_t off, uint64_t buf, uint64_t size) {
     uint64_t n = file.entry ? game_image()->read(*file.entry, uint64_t(off), reinterpret_cast<void*>(buf), size)
                             : plat::read_at(file.f, off, reinterpret_cast<void*>(buf), size);
     uint64_t ms = (plat::monotonic_ns() - t0) / 1'000'000;
-    if (g_trace) log("fs: read %s at %lld size %llu -> %llu", file.path.c_str(), (long long)off, (unsigned long long)size,
+    if (g_trace || file.path.rfind("sd:", 0) == 0) log("fs: read %s at %lld size %llu -> %llu", file.path.c_str(), (long long)off, (unsigned long long)size,
                      (unsigned long long)n);
     if (trace_fs() && file.path.find(".bwav") != std::string::npos) {  // streamed audio: is it being consumed?
         static std::mutex m;
@@ -549,7 +549,7 @@ void OpenDirectory(CPU& c) {  // (DirectoryHandle* out, path, int mode: 1 dirs, 
     std::error_code ec;
     bool found = !p.empty() && fs::is_directory(p, ec);
     note_open("OpenDirectory", cstr(c.x[1]), found ? "ok" : "not found");
-    if (trace_fs()) log("fs: OpenDirectory(%s, %d)%s", cstr(c.x[1]).c_str(), mode, found ? "" : " not found");
+    if (trace_fs() || cstr(c.x[1]).rfind("sd:", 0) == 0) log("fs: OpenDirectory(%s, %d)%s", cstr(c.x[1]).c_str(), mode, found ? "" : " not found");
     if (!found) {
         c.x[0] = kPathNotFound;
         return;

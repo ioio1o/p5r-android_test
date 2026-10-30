@@ -28,7 +28,7 @@ void linear_write_back_pause(bool paused);  // runtime nvn_draw.cpp: no copies o
 
 const game::Info game::kInfo = {"p5r", "Persona 5 Royal", 0x01005CA01580E000ull, "io.github.p5rrecomp",
                                 "private/p5r", 0 /* main.npdm: no system resource (SDK 13) */,
-                                "D4B150B29A931CD3" /* Persona 5 Royal 1.0.2 */};
+                                "D4B150B29A931CD3" /* Persona 5 Royal 1.0.2 */, "1.0.2"};
 
 namespace {
 

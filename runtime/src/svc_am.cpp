@@ -1,4 +1,5 @@
 // am services (appletOE): application proxy, focus/operation-mode state, launch parameters.
+#include <nx/game.h>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -228,17 +229,17 @@ std::shared_ptr<Service> application_functions() {
     return svc("IApplicationFunctions", [](Service& s) {
         s.cmds[23] = [](IpcCtx& c) {  // GetDisplayVersion
             char version[0x10]{};
-            const std::string value = game_display_version();
+            const char* value = game::kInfo.display_version ? game::kInfo.display_version : "";
 
-            const size_t count =
-                value.size() < sizeof(version) ? value.size() : sizeof(version);
+            const size_t value_size = std::strlen(value);
+            const size_t count = value_size < sizeof(version) - 1
+                ? value_size : sizeof(version) - 1;
 
             if (count)
-                std::memcpy(version, value.data(), count);
+                std::memcpy(version, value, count);
 
             c.out.insert(c.out.end(), version, version + sizeof(version));
-            log("am: GetDisplayVersion -> %.*s",
-                static_cast<int>(sizeof(version)), version);
+            log("am: GetDisplayVersion -> %s", version);
             return 0u;
         };
         s.cmds[1] = [](IpcCtx& c) {  // PopLaunchParameter(kind): the preselected user, once

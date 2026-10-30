@@ -18,6 +18,7 @@ struct Info {
     // Native execution (NX_NCE): the start of the build ID (hex) the game's glue is made for, checked against the
     // player's exefs/main (the hooks and offsets in game.cpp are those of one version). Null: any.
     const char* main_build_id = nullptr;
+    const char* display_version = nullptr;
 };
 extern const Info kInfo;
 
