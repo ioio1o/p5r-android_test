@@ -17,6 +17,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <ucontext.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <malloc.h>
@@ -405,7 +406,45 @@ struct sigaction g_previous[32];  // the handlers before ours (debuggerd's)
 
 void crash(int sig, siginfo_t* info, void* uc) {
     if ((sig == SIGSEGV || sig == SIGBUS) && nx::plat::write_watch_fault(info->si_addr)) return;  // write_watch.cpp
-    nx::log("CRASH: signal %d, fault address %p", sig, info->si_addr);
+    nx::log("CRASH: signal %d, code %d, errno %d, fault address %p",
+            sig, info->si_code, info->si_errno, info->si_addr);
+
+#if defined(__aarch64__)
+    const auto& host = static_cast<ucontext_t*>(uc)->uc_mcontext;
+    const uint64_t pc = host.pc;
+    const uint64_t lr = host.regs[30];
+    const uint64_t sp = host.sp;
+
+    Dl_info host_symbol{};
+    const bool has_symbol = dladdr(reinterpret_cast<void*>(pc), &host_symbol) != 0;
+    const uint64_t module_offset =
+        has_symbol && host_symbol.dli_fbase
+            ? pc - reinterpret_cast<uint64_t>(host_symbol.dli_fbase)
+            : 0;
+
+    nx::log("  HOST PC %s+0x%llx (%s)",
+            has_symbol && host_symbol.dli_fname ? host_symbol.dli_fname : "?",
+            (unsigned long long)module_offset,
+            has_symbol && host_symbol.dli_sname ? host_symbol.dli_sname : "?");
+    nx::log("  HOST pc=%016llx lr=%016llx sp=%016llx pstate=%016llx",
+            (unsigned long long)pc, (unsigned long long)lr,
+            (unsigned long long)sp, (unsigned long long)host.pstate);
+
+    for (int k = 0; k < 28; k += 4) {
+        nx::log("  HOST x%-2d %016llx %016llx %016llx %016llx",
+                k,
+                (unsigned long long)host.regs[k],
+                (unsigned long long)host.regs[k + 1],
+                (unsigned long long)host.regs[k + 2],
+                (unsigned long long)host.regs[k + 3]);
+    }
+    nx::log("  HOST x28 %016llx x29 %016llx x30 %016llx",
+            (unsigned long long)host.regs[28],
+            (unsigned long long)host.regs[29],
+            (unsigned long long)host.regs[30]);
+#else
+    nx::log("  HOST register dump unavailable for this architecture");
+#endif
 #if NX_NCE
     // In the game's own code: its registers are in the signal's context, not in the thread's CPU.
     if (nx::self_thread()) {
