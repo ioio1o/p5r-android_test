@@ -120,20 +120,6 @@ static void rtld_init(CPU&) {}
 static void rtld_fini(CPU&) {}
 static void rtld_mark(CPU&) {}
 
-// nnMain, as called by nn::init::Start: the constructors need the program's allocator, which nninitStartup has
-// set up by now, so they run here, right before the real nnMain.
-static void nn_main(CPU& c) {
-    init_module(c, *g_sdk);
-    init_module(c, *g_main);
-    game::after_init();
-    log("entering nnMain");
-    uint64_t real = 0;
-    for (size_t k = 0; k < g_main->symbol_count; k++)
-        if (!g_main->symbols[k].imported && std::string(g_main->symbols[k].name) == "nnMain")
-            real = g_main->base + g_main->symbols[k].value;
-    call(c, real);
-}
-
 // longjmp(buf, val): unwinds the host stack to the recompiled function that called setjmp on buf.
 static void long_jmp(CPU& c) { throw LongJmp{c.x[0], uint32_t(c.x[1])}; }
 
@@ -142,7 +128,6 @@ static void process_return(CPU&) {
     plat::exit_process(0);
 }
 
-NX_HLE("nnMain", nn_main);
 NX_HLE("longjmp", long_jmp);
 NX_HLE("_longjmp", long_jmp);
 NX_HLE("__rtld_init", rtld_init);
@@ -195,10 +180,21 @@ struct SkylinePluginRuntime {
     ModuleInfo info{};
     uint64_t base = 0;
     uint64_t mapped_size = 0;
+
+    uint64_t dt_init = 0;
+    uint64_t dt_init_array = 0;
+    uint64_t dt_init_array_size = 0;
+
+    size_t imports_plugin = 0, imports_hle = 0;
+    size_t imports_main = 0, imports_sdk = 0, imports_unresolved = 0;
+
+    size_t reloc_relative = 0, reloc_glob_dat = 0;
+    size_t reloc_jump_slot = 0, reloc_abs64 = 0;
 };
 
 static std::vector<std::unique_ptr<SkylinePluginRuntime>> g_skyline_plugins;
 static uint64_t g_skyline_next_slot = 0;
+static void run_skyline_plugins(CPU& c);
 
 static constexpr uint64_t kSkylinePluginBase = 0x4030000000ull;
 static constexpr uint64_t kSkylinePluginSlotSize = 0x10000000ull;
@@ -218,92 +214,202 @@ static uint64_t skyline_module_symbol(const ModuleInfo* module,
     return 0;
 }
 
-static uint64_t skyline_readable_remaining(uint64_t address) {
-    auto check = [address](uint64_t base, uint64_t size) -> uint64_t {
-        if (size && address >= base && address - base < size)
-            return size - (address - base);
-        return 0;
-    };
 
-    for (const auto& p : g_skyline_plugins) {
-        uint64_t n = check(p->base, p->mapped_size);
-        if (n) return n;
-    }
+static bool guest_range_ok(
+    uint64_t address,
+    uint64_t length,
+    uint32_t permission
+) {
+    if (!address || !length || address > UINT64_MAX - length)
+        return false;
 
-    const ModuleInfo* modules[] = {g_main, g_sdk};
-    for (const ModuleInfo* m : modules) {
-        if (!m) continue;
-        const uint64_t ends[] = {
-            m->text + m->text_size,
-            m->ro + m->ro_size,
-            m->data + m->data_size + m->bss_size
-        };
-        for (uint64_t end : ends) {
-            if (end && address >= m->base && address - m->base < end)
-                return end - (address - m->base);
+    const uint64_t end = address + length;
+    uint64_t cursor = address;
+
+    while (cursor < end) {
+        const VmInfo region = vm_query(cursor);
+
+        if (region.state == kMemFree ||
+            region.state == kMemInaccessible ||
+            (region.perm & permission) != permission ||
+            !region.size ||
+            cursor < region.addr ||
+            region.addr > UINT64_MAX - region.size) {
+            return false;
         }
+
+        const uint64_t region_end = region.addr + region.size;
+        if (region_end <= cursor)
+            return false;
+
+        cursor = std::min(end, region_end);
     }
-    return 0;
+
+    return true;
 }
 
-static void skyline_get_region(CPU& c) {
-    if (!g_main) {
-        c.x[0] = 0;
+static bool skyline_main_text_target(uint64_t target) {
+    if (!g_main || !g_main->text_size)
+        return false;
+
+    const uint64_t begin = g_main->base + g_main->text;
+    return target >= begin && target - begin < g_main->text_size;
+}
+
+static const char* skyline_pc_relative_kind(uint32_t insn) {
+    if ((insn & 0x1F000000u) == 0x10000000u) return "ADR/ADRP";
+    if ((insn & 0x7C000000u) == 0x14000000u) return "B/BL";
+    if ((insn & 0x3B000000u) == 0x18000000u) return "literal-load";
+    if ((insn & 0xFF000010u) == 0x54000000u) return "B.cond";
+    if ((insn & 0x7E000000u) == 0x34000000u) return "CBZ/CBNZ";
+    if ((insn & 0x7E000000u) == 0x36000000u) return "TBZ/TBNZ";
+    return "other/non-PC-relative";
+}
+
+static void skyline_log_hook_target(const char* hook, uint64_t target) {
+    if (!skyline_main_text_target(target))
+        return;
+
+    if (!guest_range_ok(target, sizeof(uint32_t), 1)) {
+        log("skyline: %s target=%llx is in main text but unreadable",
+            hook, (unsigned long long)target);
         return;
     }
 
-    switch (c.x[0]) {
-    case 0: c.x[0] = g_main->base + g_main->text; break;
-    case 1: c.x[0] = g_main->base + g_main->ro; break;
-    case 2: c.x[0] = g_main->base + g_main->data; break;
-    case 3: c.x[0] = g_main->base + g_main->bss; break;
-    case 4: c.x[0] = kHeapBase; break;
-    default: c.x[0] = 0; break;
+    uint32_t instruction = 0;
+    std::memcpy(
+        &instruction,
+        reinterpret_cast<const void*>(target),
+        sizeof(instruction)
+    );
+
+    log("skyline: %s main-text target=%llx first_insn=%08x pc_relative=%s",
+        hook,
+        (unsigned long long)target,
+        instruction,
+        skyline_pc_relative_kind(instruction)
+    );
+}
+
+static void skyline_get_region(CPU& c) {
+    const uint64_t requested = c.x[0];
+    uint64_t result = 0;
+
+    if (g_main) {
+        switch (requested) {
+            case 0: result = g_main->base + g_main->text; break;
+            case 1: result = g_main->base + g_main->ro; break;
+            case 2: result = g_main->base + g_main->data; break;
+            case 3: result = g_main->base + g_main->bss; break;
+            case 4: result = kHeapBase; break;
+            default: break;
+        }
     }
+
+    c.x[0] = result;
+
+    log("skyline: getRegionAddress region=%llu -> %llx",
+        (unsigned long long)requested,
+        (unsigned long long)result
+    );
 }
 
 static void skyline_tcp_send_raw(CPU& c) {
     const uint64_t address = c.x[0];
-    const uint64_t remaining = skyline_readable_remaining(address);
-    if (!remaining) {
-        log("skyline_tcp_send_raw: rejected unmapped pointer %llx",
+
+    if (!guest_range_ok(address, 1, 1)) {
+        log("skyline: TCP rejected unreadable pointer %llx",
             (unsigned long long)address);
         return;
     }
 
-    const size_t limit = static_cast<size_t>(
-        std::min<uint64_t>(remaining, 1024));
-    const char* text = reinterpret_cast<const char*>(address);
-    const void* end = std::memchr(text, 0, limit);
-    if (!end) {
-        log("skyline_tcp_send_raw: rejected unterminated string at %llx",
-            (unsigned long long)address);
-        return;
+    char raw[1024];
+    size_t count = 0;
+
+    for (; count < sizeof(raw); ++count) {
+        if (address > UINT64_MAX - count ||
+            !guest_range_ok(address + count, 1, 1)) {
+            break;
+        }
+
+        const char ch =
+            *reinterpret_cast<const char*>(address + count);
+
+        if (!ch)
+            break;
+
+        raw[count] = ch;
     }
 
-    std::string message(text, static_cast<const char*>(end) - text);
-    log("skyline_tcp: %s", message.c_str());
+    while (count &&
+           (raw[count - 1] == '\n' || raw[count - 1] == '\r')) {
+        --count;
+    }
+
+    std::string sanitized;
+    sanitized.reserve(count);
+
+    for (size_t i = 0; i < count; ++i) {
+        const unsigned char ch = static_cast<unsigned char>(raw[i]);
+        sanitized.push_back(
+            ch >= 0x20 && ch <= 0x7e
+                ? static_cast<char>(ch)
+                : '.'
+        );
+    }
+
+    log("plugin: %s", sanitized.c_str());
 }
 
 static void skyline_a64_hook_function(CPU& c) {
-    log("skyline: A64HookFunction no-op target=%llx replacement=%llx "
-        "result_slot=%llx (guest memory unchanged)",
-        (unsigned long long)c.x[0],
-        (unsigned long long)c.x[1],
-        (unsigned long long)c.x[2]);
+    const uint64_t target = c.x[0];
+    const uint64_t replacement = c.x[1];
+    const uint64_t result_slot = c.x[2];
+
+    skyline_log_hook_target("A64HookFunction", target);
+
+    if ((result_slot & 7) == 0 &&
+        guest_range_ok(result_slot, sizeof(uint64_t), 3)) {
+        std::memcpy(
+            reinterpret_cast<void*>(result_slot),
+            &target,
+            sizeof(target)
+        );
+
+        log("skyline: A64HookFunction no-op target=%llx replacement=%llx; "
+            "original target returned at %llx; guest code unchanged",
+            (unsigned long long)target,
+            (unsigned long long)replacement,
+            (unsigned long long)result_slot
+        );
+    } else {
+        log("skyline: A64HookFunction no-op target=%llx replacement=%llx; "
+            "invalid result slot=%llx; guest code unchanged",
+            (unsigned long long)target,
+            (unsigned long long)replacement,
+            (unsigned long long)result_slot
+        );
+    }
 }
 
 static void skyline_a64_inline_hook(CPU& c) {
-    log("skyline: A64InlineHook no-op target=%llx replacement=%llx "
-        "result_slot=none",
-        (unsigned long long)c.x[0],
-        (unsigned long long)c.x[1]);
+    const uint64_t target = c.x[0];
+    const uint64_t replacement = c.x[1];
+
+    skyline_log_hook_target("A64InlineHook", target);
+
+    log("skyline: A64InlineHook no-op target=%llx replacement=%llx; "
+        "guest code unchanged",
+        (unsigned long long)target,
+        (unsigned long long)replacement
+    );
 }
 
 NX_HLE("getRegionAddress", skyline_get_region);
 NX_HLE("skyline_tcp_send_raw", skyline_tcp_send_raw);
 NX_HLE("A64HookFunction", skyline_a64_hook_function);
 NX_HLE("A64InlineHook", skyline_a64_inline_hook);
+
 
 struct SkylineElfRela {
     uint64_t offset;
@@ -324,7 +430,10 @@ static bool skyline_parse_dynamic(
     uint64_t& relaent,
     uint64_t& jmprel,
     uint64_t& pltrelsz,
-    uint64_t& pltrel) {
+    uint64_t& pltrel,
+    uint64_t& dt_init,
+    uint64_t& dt_init_array,
+    uint64_t& dt_init_array_size) {
 
     int32_t relative = 0;
     if (!nro_read(image, mod0 + 4, relative))
@@ -345,6 +454,9 @@ static bool skyline_parse_dynamic(
     constexpr int64_t DT_JMPREL = 23;
     constexpr int64_t DT_PLTRELSZ = 2;
     constexpr int64_t DT_PLTREL = 20;
+    constexpr int64_t DT_INIT = 12;
+    constexpr int64_t DT_INIT_ARRAY = 25;
+    constexpr int64_t DT_INIT_ARRAYSZ = 27;
 
     bool terminated = false;
     for (size_t i = 0; i < 4096; ++i) {
@@ -369,6 +481,9 @@ static bool skyline_parse_dynamic(
         case DT_JMPREL: jmprel = value; break;
         case DT_PLTRELSZ: pltrelsz = value; break;
         case DT_PLTREL: pltrel = value; break;
+        case DT_INIT: dt_init = value; break;
+        case DT_INIT_ARRAY: dt_init_array = value; break;
+        case DT_INIT_ARRAYSZ: dt_init_array_size = value; break;
         default: break;
         }
     }
@@ -456,10 +571,11 @@ static bool load_skyline_nro(const std::filesystem::path& path) {
     uint64_t hash = 0, strtab = 0, symtab = 0, strsz = 0;
     uint64_t rela = 0, relasz = 0, relaent = 0;
     uint64_t jmprel = 0, pltrelsz = 0, pltrel = 0;
+    uint64_t dt_init = 0, dt_init_array = 0, dt_init_array_size = 0;
 
     if (!skyline_parse_dynamic(nro->image, nro->mod0_offset,
             hash, strtab, symtab, strsz, rela, relasz, relaent,
-            jmprel, pltrelsz, pltrel) ||
+            jmprel, pltrelsz, pltrel, dt_init, dt_init_array, dt_init_array_size) ||
         (pltrelsz && pltrel != 7)) {
         log("skyline: %s has invalid dynamic metadata", plugin_name.c_str());
         return false;
@@ -484,6 +600,9 @@ static bool load_skyline_nro(const std::filesystem::path& path) {
     plugin->name = plugin_name;
     plugin->nro = std::move(nro);
     plugin->base = base;
+    plugin->dt_init = dt_init;
+    plugin->dt_init_array = dt_init_array;
+    plugin->dt_init_array_size = dt_init_array_size;
 
     const auto& image = plugin->nro->image;
     plugin->names.resize(symbol_count);
@@ -590,7 +709,7 @@ static bool load_skyline_nro(const std::filesystem::path& path) {
 
     for (uint32_t i = 0; i < symbol_count; ++i) {
         const Symbol& sym = plugin->symbols[i];
-        if (!sym.imported)
+        if (i == 0 || !sym.imported)
             continue;
 
         const char* name = plugin->names[i].c_str();
@@ -777,6 +896,11 @@ static bool load_skyline_nro(const std::filesystem::path& path) {
         "unresolved=%zu",
         plugin->name.c_str(), imports_plugin, imports_hle,
         imports_main, imports_sdk, imports_unresolved);
+    plugin->imports_plugin = imports_plugin;
+    plugin->imports_hle = imports_hle;
+    plugin->imports_main = imports_main;
+    plugin->imports_sdk = imports_sdk;
+    plugin->imports_unresolved = imports_unresolved;
 
     log("skyline: %s relocations applied: RELATIVE=%zu GLOB_DAT=%zu "
         "JUMP_SLOT=%zu ABS64=%zu; targets text=%zu ro=%zu data=%zu "
@@ -784,6 +908,10 @@ static bool load_skyline_nro(const std::filesystem::path& path) {
         plugin->name.c_str(), applied_relative, applied_glob_dat,
         applied_jump_slot, applied_abs64, targets_text, targets_ro,
         targets_data, targets_bss, targets_outside);
+    plugin->reloc_relative = applied_relative;
+    plugin->reloc_glob_dat = applied_glob_dat;
+    plugin->reloc_jump_slot = applied_jump_slot;
+    plugin->reloc_abs64 = applied_abs64;
 
     if (!relocation_ok) {
         decommit(base, mapped_size);
@@ -811,7 +939,7 @@ static bool load_skyline_nro(const std::filesystem::path& path) {
     }
 
     log("skyline: %s mapped at %llx (+%llx), %zu symbols, %zu relocations; "
-        "NCE prepared; execution disabled",
+        "NCE prepared; execution deferred until nnMain",
         plugin_name.c_str(),
         (unsigned long long)base,
         (unsigned long long)mapped_size,
@@ -822,12 +950,190 @@ static bool load_skyline_nro(const std::filesystem::path& path) {
     return true;
 }
 
+
+static bool skyline_plugin_function(
+    const SkylinePluginRuntime& plugin,
+    uint64_t address
+) {
+    const uint64_t text_begin = plugin.base + plugin.info.text;
+
+    return plugin.info.text_size &&
+           address >= text_begin &&
+           address - text_begin < plugin.info.text_size &&
+           (address & 3) == 0 &&
+           guest_range_ok(address, sizeof(uint32_t), 1);
+}
+
+static void run_skyline_plugins(CPU& c) {
+    for (const auto& owned : g_skyline_plugins) {
+        SkylinePluginRuntime& plugin = *owned;
+
+        log("skyline: begin controlled execution of %s",
+            plugin.name.c_str());
+
+        if (plugin.dt_init) {
+            const uint64_t target = plugin.base + plugin.dt_init;
+
+            if (plugin.dt_init < plugin.info.text_size &&
+                skyline_plugin_function(plugin, target)) {
+                log("skyline: %s calling DT_INIT at %llx",
+                    plugin.name.c_str(),
+                    (unsigned long long)target);
+
+                call_preserving(c, target);
+
+                log("skyline: %s DT_INIT returned",
+                    plugin.name.c_str());
+            } else {
+                log("skyline: %s skipped invalid DT_INIT offset=%llx",
+                    plugin.name.c_str(),
+                    (unsigned long long)plugin.dt_init);
+            }
+        }
+
+        if (plugin.dt_init_array_size) {
+            const uint64_t offset = plugin.dt_init_array;
+            const uint64_t size = plugin.dt_init_array_size;
+
+            if (!offset ||
+                size % sizeof(uint64_t) ||
+                size / sizeof(uint64_t) > 4096 ||
+                offset > plugin.nro->image.size() ||
+                size > plugin.nro->image.size() - offset ||
+                offset > plugin.mapped_size ||
+                size > plugin.mapped_size - offset ||
+                !guest_range_ok(plugin.base + offset, size, 1)) {
+                log("skyline: %s rejected DT_INIT_ARRAY offset=%llx size=%llx",
+                    plugin.name.c_str(),
+                    (unsigned long long)offset,
+                    (unsigned long long)size);
+            } else {
+                const size_t count =
+                    static_cast<size_t>(size / sizeof(uint64_t));
+
+                for (size_t i = 0; i < count; ++i) {
+                    uint64_t target = 0;
+
+                    std::memcpy(
+                        &target,
+                        reinterpret_cast<const void*>(
+                            plugin.base + offset + i * sizeof(uint64_t)
+                        ),
+                        sizeof(target)
+                    );
+
+                    if (!target)
+                        continue;
+
+                    if (!skyline_plugin_function(plugin, target)) {
+                        log("skyline: %s skipped invalid init_array[%zu]=%llx",
+                            plugin.name.c_str(),
+                            i,
+                            (unsigned long long)target);
+                        continue;
+                    }
+
+                    log("skyline: %s calling init_array[%zu] at %llx",
+                        plugin.name.c_str(),
+                        i,
+                        (unsigned long long)target);
+
+                    call_preserving(c, target);
+
+                    log("skyline: %s init_array[%zu] returned",
+                        plugin.name.c_str(),
+                        i);
+                }
+            }
+        }
+
+        uint64_t entry = 0;
+
+        for (size_t i = 1; i < plugin.symbols.size(); ++i) {
+            const Symbol& symbol = plugin.symbols[i];
+
+            if (!symbol.imported && plugin.names[i] == "main") {
+                entry = plugin.base + symbol.value;
+                break;
+            }
+        }
+
+        if (!entry || !skyline_plugin_function(plugin, entry)) {
+            log("skyline: %s has no valid main entry; execution stopped",
+                plugin.name.c_str());
+            continue;
+        }
+
+        for (unsigned i = 0; i < 8; ++i)
+            c.x[i] = 0;
+
+        log("skyline: %s calling plugin main at %llx",
+            plugin.name.c_str(),
+            (unsigned long long)entry);
+
+        call_preserving(c, entry);
+
+        log("skyline: %s plugin main returned",
+            plugin.name.c_str());
+
+        log("skyline: %s post-main imports: plugin=%zu HLE=%zu main=%zu "
+            "SDK=%zu unresolved=%zu; relocations: RELATIVE=%zu "
+            "GLOB_DAT=%zu JUMP_SLOT=%zu ABS64=%zu",
+            plugin.name.c_str(),
+            plugin.imports_plugin,
+            plugin.imports_hle,
+            plugin.imports_main,
+            plugin.imports_sdk,
+            plugin.imports_unresolved,
+            plugin.reloc_relative,
+            plugin.reloc_glob_dat,
+            plugin.reloc_jump_slot,
+            plugin.reloc_abs64
+        );
+    }
+}
+
 static void inspect_skyline_nro(const std::filesystem::path& path) {
     (void)load_skyline_nro(path);
 }
 
 }  // namespace
 #endif
+
+// Run prepared Skyline plugins after game initialization and immediately
+// before entering the real game nnMain.
+static void nn_main(CPU& c) {
+    init_module(c, *g_sdk);
+    init_module(c, *g_main);
+    game::after_init();
+
+#if NX_NCE
+    run_skyline_plugins(c);
+#endif
+
+    log("entering nnMain");
+
+    uint64_t real = 0;
+
+    for (size_t k = 0; k < g_main->symbol_count; ++k) {
+        const Symbol& symbol = g_main->symbols[k];
+
+        if (!symbol.imported && symbol.name &&
+            std::strcmp(symbol.name, "nnMain") == 0) {
+            real = g_main->base + symbol.value;
+            break;
+        }
+    }
+
+    if (!real) {
+        fatal("real nnMain export not found");
+        return;
+    }
+
+    call(c, real);
+}
+
+NX_HLE("nnMain", nn_main);
 
 // ---- boot -----------------------------------------------------------------------------------------------------
 
@@ -928,8 +1234,8 @@ void boot() {
     };
     load_modules(mods, 2, "", images, static_cast<size_t>(-1));
 
-    // Main/SDK exports are now linked. Relocate and NCE-prepare plugins,
-    // but do not execute constructors or entry points.
+    // Main/SDK exports are linked before plugin relocation and preparation.
+// Plugin constructors and entry points run later from nn_main.
     for (const fs::path& plugin_path : plugin_paths)
         inspect_skyline_nro(plugin_path);
 #else
