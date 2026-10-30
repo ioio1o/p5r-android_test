@@ -366,10 +366,8 @@ static void skyline_tcp_send_raw(CPU& c) {
 
     size_t printable_count = count;
     while (printable_count &&
-           (raw[printable_count - 1] == '
-' ||
-            raw[printable_count - 1] == '
-')) {
+           (raw[printable_count - 1] == '\r' ||
+            raw[printable_count - 1] == '\n')) {
         --printable_count;
     }
 
