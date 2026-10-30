@@ -280,7 +280,7 @@ static void inspect_skyline_nro(const std::filesystem::path& path) {
     const std::string plugin_name = path.filename().string();
     if (!terminated || !hash || !strtab || !symtab || !strsz ||
         syment != sizeof(NroDynamicSymbol)) {
-        log("skyline: %s: missing or invalid dynamic symbol metadata", plugin_name);
+        log("skyline: %s: missing or invalid dynamic symbol metadata", plugin_name.c_str());
         return;
     }
 
@@ -292,7 +292,7 @@ static void inspect_skyline_nro(const std::filesystem::path& path) {
         symtab > image.size() ||
         uint64_t(symbol_count) > (image.size() - symtab) / sizeof(NroDynamicSymbol) ||
         strtab > image.size() || strsz > image.size() - strtab) {
-        log("skyline: %s: invalid hash, symbol, or string table bounds", plugin_name);
+        log("skyline: %s: invalid hash, symbol, or string table bounds", plugin_name.c_str());
         return;
     }
     (void)bucket_count;
@@ -305,7 +305,7 @@ static void inspect_skyline_nro(const std::filesystem::path& path) {
         const uint64_t at = symtab + uint64_t(i) * sizeof(symbol);
 
         if (!nro_read(image, at, symbol)) {
-            log("skyline: %s: truncated dynamic symbol table", plugin_name);
+            log("skyline: %s: truncated dynamic symbol table", plugin_name.c_str());
             return;
         }
 
@@ -318,7 +318,7 @@ static void inspect_skyline_nro(const std::filesystem::path& path) {
         const size_t remaining = static_cast<size_t>(strsz - symbol.name);
         const void* end = std::memchr(start, '\0', remaining);
         if (!end) {
-            log("skyline: %s: unterminated symbol name at index %u", plugin_name, i);
+            log("skyline: %s: unterminated symbol name at index %u", plugin_name.c_str(), i);
             return;
         }
 
@@ -365,6 +365,7 @@ static void inspect_skyline_nro(const std::filesystem::path& path) {
     // Count AArch64 Elf64_Rela relocation types without applying them.
     auto relocation_name = [](uint32_t type) -> const char* {
         switch (type) {
+            case 0: return "NONE";
             case 257: return "ABS64";
             case 258: return "ABS32";
             case 259: return "ABS16";
@@ -375,17 +376,18 @@ static void inspect_skyline_nro(const std::filesystem::path& path) {
             case 277: return "ADD_ABS_LO12_NC";
             case 282: return "JUMP26";
             case 283: return "CALL26";
-            case 1024: return "TLS_DTPMOD";
-            case 1025: return "TLS_DTPREL";
-            case 1026: return "TLS_TPREL";
-            case 1027: return "TLS_DESC";
-            case 1025 + 1: return "GLOB_DAT";
-            case 1027 + 1: return "JUMP_SLOT";
-            case 1028: return "RELATIVE";
+            case 1024: return "COPY";
+            case 1025: return "GLOB_DAT";
+            case 1026: return "JUMP_SLOT";
+            case 1027: return "RELATIVE";
+            case 1028: return "TLS_DTPREL";
+            case 1029: return "TLS_DTPMOD";
+            case 1030: return "TLS_TPREL";
+            case 1031: return "TLSDESC";
+            case 1032: return "IRELATIVE";
             default: return "OTHER";
         }
     };
-
     auto report_relocations = [&](const char* table_name,
                                   uint64_t offset, uint64_t size,
                                   uint64_t entry_size) {
@@ -448,7 +450,7 @@ static void inspect_skyline_nro(const std::filesystem::path& path) {
     }
 
     log("skyline: %s dry-run: %zu imports; plugin=%zu HLE=%zu main/sdk=%zu unresolved=%zu",
-        plugin_name, imports, local, hle, game, unresolved);
+        plugin_name.c_str(), imports, local, hle, game, unresolved);
 }
 
 }  // namespace
