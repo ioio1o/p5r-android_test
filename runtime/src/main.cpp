@@ -235,8 +235,16 @@ static void inspect_skyline_nro(const std::filesystem::path& path) {
     constexpr int64_t DT_SYMTAB = 6;
     constexpr int64_t DT_STRSZ = 10;
     constexpr int64_t DT_SYMENT = 11;
+    constexpr int64_t DT_RELA = 7;
+    constexpr int64_t DT_RELASZ = 8;
+    constexpr int64_t DT_RELAENT = 9;
+    constexpr int64_t DT_PLTRELSZ = 2;
+    constexpr int64_t DT_PLTREL = 20;
+    constexpr int64_t DT_JMPREL = 23;
 
     uint64_t hash = 0, strtab = 0, symtab = 0, strsz = 0, syment = 0;
+    uint64_t rela = 0, relasz = 0, relaent = 0;
+    uint64_t jmprel = 0, pltrelsz = 0, pltrel = 0;
     bool terminated = false;
 
     // Elf64_Dyn entries are 16 bytes. Bound the scan even if the file is malformed.
@@ -259,11 +267,17 @@ static void inspect_skyline_nro(const std::filesystem::path& path) {
             case DT_SYMTAB: symtab = value; break;
             case DT_STRSZ:  strsz = value; break;
             case DT_SYMENT: syment = value; break;
+            case DT_RELA: rela = value; break;
+            case DT_RELASZ: relasz = value; break;
+            case DT_RELAENT: relaent = value; break;
+            case DT_JMPREL: jmprel = value; break;
+            case DT_PLTRELSZ: pltrelsz = value; break;
+            case DT_PLTREL: pltrel = value; break;
             default: break;
         }
     }
 
-    const char* plugin_name = path.filename().string().c_str();
+    const std::string plugin_name = path.filename().string();
     if (!terminated || !hash || !strtab || !symtab || !strsz ||
         syment != sizeof(NroDynamicSymbol)) {
         log("skyline: %s: missing or invalid dynamic symbol metadata", plugin_name);
@@ -345,6 +359,92 @@ static void inspect_skyline_nro(const std::filesystem::path& path) {
         }
 
         log("skyline: import[%u] %s -> %s", i, name, source);
+    }
+
+
+    // Count AArch64 Elf64_Rela relocation types without applying them.
+    auto relocation_name = [](uint32_t type) -> const char* {
+        switch (type) {
+            case 257: return "ABS64";
+            case 258: return "ABS32";
+            case 259: return "ABS16";
+            case 260: return "PREL64";
+            case 261: return "PREL32";
+            case 262: return "PREL16";
+            case 275: return "ADR_PREL_PG_HI21";
+            case 277: return "ADD_ABS_LO12_NC";
+            case 282: return "JUMP26";
+            case 283: return "CALL26";
+            case 1024: return "TLS_DTPMOD";
+            case 1025: return "TLS_DTPREL";
+            case 1026: return "TLS_TPREL";
+            case 1027: return "TLS_DESC";
+            case 1025 + 1: return "GLOB_DAT";
+            case 1027 + 1: return "JUMP_SLOT";
+            case 1028: return "RELATIVE";
+            default: return "OTHER";
+        }
+    };
+
+    auto report_relocations = [&](const char* table_name,
+                                  uint64_t offset, uint64_t size,
+                                  uint64_t entry_size) {
+        constexpr uint64_t kRelaSize = 24;
+
+        if (size == 0) {
+            log("skyline: %s relocations: 0", table_name);
+            return;
+        }
+
+        if (!offset || entry_size != kRelaSize ||
+            size % kRelaSize != 0 ||
+            offset > image.size() || size > image.size() - offset) {
+            log("skyline: %s relocations: invalid table bounds/entry size",
+                table_name);
+            return;
+        }
+
+        std::vector<std::pair<uint32_t, size_t>> counts;
+        const uint64_t total = size / kRelaSize;
+
+        for (uint64_t i = 0; i < total; ++i) {
+            uint64_t info = 0;
+            const uint64_t at = offset + i * kRelaSize + 8;
+
+            if (!nro_read(image, at, info)) {
+                log("skyline: %s relocations: truncated entry %llu",
+                    table_name, static_cast<unsigned long long>(i));
+                return;
+            }
+
+            const uint32_t type = static_cast<uint32_t>(info);
+            auto it = std::find_if(counts.begin(), counts.end(),
+                [type](const auto& item) { return item.first == type; });
+
+            if (it == counts.end())
+                counts.emplace_back(type, 1);
+            else
+                ++it->second;
+        }
+
+        log("skyline: %s relocations: %llu entries",
+            table_name, static_cast<unsigned long long>(total));
+
+        for (const auto& item : counts) {
+            log("skyline:   type %u (%s): %zu",
+                item.first, relocation_name(item.first), item.second);
+        }
+    };
+
+    report_relocations("DT_RELA", rela, relasz, relaent);
+
+    if (pltrel == DT_RELA) {
+        report_relocations("DT_JMPREL", jmprel, pltrelsz, relaent);
+    } else if (pltrelsz != 0) {
+        log("skyline: DT_JMPREL uses unsupported relocation format %llu",
+            static_cast<unsigned long long>(pltrel));
+    } else {
+        log("skyline: DT_JMPREL relocations: 0");
     }
 
     log("skyline: %s dry-run: %zu imports; plugin=%zu HLE=%zu main/sdk=%zu unresolved=%zu",

@@ -148,14 +148,14 @@ std::unique_ptr<NroImage> parse_nro_bytes(
             segment.size);
     }
 
-    // A dynamically loadable Skyline plugin needs module metadata.
-    // Verify the MOD0 header is inside text and the full header is present.
+        // MOD0 may reside in text, RO, or data. Validate it against the
+    // complete reconstructed NRO image, not only the text segment.
     constexpr uint64_t kMod0HeaderSize = 0x1C;
 
-    if (mod0_offset < result->text ||
-        mod0_offset > result->text + result->text_size ||
-        kMod0HeaderSize > result->text + result->text_size - mod0_offset) {
-        return fail("MOD0 header lies outside the text segment");
+    if ((mod0_offset & 3) != 0 ||
+        mod0_offset > result->image.size() ||
+        kMod0HeaderSize > result->image.size() - mod0_offset) {
+        return fail("MOD0 header is misaligned or outside the NRO image");
     }
 
     if (std::memcmp(result->image.data() + mod0_offset, "MOD0", 4) != 0)
