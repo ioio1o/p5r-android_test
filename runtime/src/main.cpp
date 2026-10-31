@@ -484,6 +484,13 @@ static void skyline_memcpy(CPU& c) {
             continue;
 
         const SkylinePluginRuntime& plugin = *owned;
+        if (plugin.info.data_size >
+            UINT64_MAX - plugin.info.bss_size)
+            continue;
+
+        const uint64_t data_extent =
+            plugin.info.data_size + plugin.info.bss_size;
+
         const struct {
             uint64_t offset;
             uint64_t size;
@@ -491,7 +498,7 @@ static void skyline_memcpy(CPU& c) {
         } ranges[] = {
             {plugin.info.text, plugin.info.text_size, Segment::Text},
             {plugin.info.ro, plugin.info.ro_size, Segment::Ro},
-            {plugin.info.data, plugin.info.data_size, Segment::Data},
+            {plugin.info.data, data_extent, Segment::Data},
         };
 
         for (const auto& range : ranges) {
