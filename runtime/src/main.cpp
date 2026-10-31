@@ -251,6 +251,9 @@ struct SkylinePluginRuntime {
 
 static std::vector<std::unique_ptr<SkylinePluginRuntime>> g_skyline_plugins;
 
+static bool guest_range_ok(
+    uint64_t address, uint64_t length, uint32_t permission);
+
 static bool skyline_plugin_text_address(uint64_t address) {
     if (!address || (address & 3))
         return false;
