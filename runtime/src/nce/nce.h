@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
@@ -39,6 +40,10 @@ void enter(CPU& c, uint64_t target);
 // Replaces the guest function at `addr` (a module's text) with fn, called as an HLE function. Returns an address
 // where the original function can still be called with call() (its first instruction moved, then a branch back),
 // 0 if the function's first instruction cannot be moved.
+// Writes to a module segment after obtaining temporary write permission.
+// used_rwx is true when RWX was available, false when RW fallback was used.
+bool write_code_checked(uint64_t addr, const void* src, size_t size,
+                        bool executable, bool* used_rwx = nullptr);
 uint64_t hook(uint64_t addr, HleFn fn);
 // Replaces a guest function with an already-validated guest address.
 uint64_t hook_guest(uint64_t addr, uint64_t replacement);

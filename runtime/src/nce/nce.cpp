@@ -710,6 +710,41 @@ void enter(CPU& c, uint64_t target) {
 }
 
 
+bool write_code_checked(uint64_t addr, const void* src, size_t size,
+                        bool executable, bool* used_rwx) {
+    if (used_rwx)
+        *used_rwx = false;
+
+    if (!addr || !src || !size || addr > UINT64_MAX - size)
+        return false;
+
+    const bool rwx = protect(
+        addr, size, PROT_READ | PROT_WRITE | PROT_EXEC);
+
+    if (!rwx &&
+        !protect(addr, size, PROT_READ | PROT_WRITE))
+        return false;
+
+    if (used_rwx)
+        *used_rwx = rwx;
+
+    std::memcpy(reinterpret_cast<void*>(addr), src, size);
+
+    const int restore_prot = executable
+        ? (PROT_READ | PROT_EXEC)
+        : (PROT_READ | PROT_WRITE);
+
+    if (!protect(addr, size, restore_prot)) {
+        log("nce: checked write at %llx completed, but restoring %s protection failed",
+            (unsigned long long)addr,
+            executable ? "RX" : "RW");
+    }
+
+    clear_cache(addr, size);
+    return true;
+}
+
+
 uint64_t hook(uint64_t addr, HleFn fn) {
     std::lock_guard lk(g_regions_lock);
     const LoadedModule* m = module_at(addr);

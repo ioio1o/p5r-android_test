@@ -441,11 +441,163 @@ static void skyline_get_region(CPU& c) {
 }
 
 
+static uint64_t g_skyline_memcpy_log_count = 0;
+
+static void skyline_memcpy(CPU& c) {
+    const uint64_t dst = c.x[0];
+    const uint64_t src = c.x[1];
+    const uint64_t requested_size = c.x[2];
+    const uint64_t caller = c.x[30];
+    const uint64_t event = ++g_skyline_memcpy_log_count;
+    const bool emit = event <= 200 || event % 1000 == 0;
+
+    auto reject = [&](const char* reason) {
+        c.x[0] = 1;
+        if (emit)
+            log("skyline: sky_memcpy #%llu rejected: %s dst=%llx src=%llx size=%llu caller=%s",
+                (unsigned long long)event, reason,
+                (unsigned long long)dst, (unsigned long long)src,
+                (unsigned long long)requested_size,
+                describe(caller).c_str());
+    };
+
+    if (!requested_size || requested_size > 0x10000 ||
+        dst > UINT64_MAX - requested_size ||
+        src > UINT64_MAX - requested_size) {
+        reject("invalid size or address");
+        return;
+    }
+
+    const size_t size = static_cast<size_t>(requested_size);
+    if (!guest_range_ok(src, size, 1)) {
+        reject("source is unreadable");
+        return;
+    }
+
+    enum class Segment { None, Text, Ro, Data };
+    Segment segment = Segment::None;
+    const SkylinePluginRuntime* owner = nullptr;
+    uint64_t segment_offset = 0;
+
+    for (const auto& owned : g_skyline_plugins) {
+        if (!owned)
+            continue;
+
+        const SkylinePluginRuntime& plugin = *owned;
+        const struct {
+            uint64_t offset;
+            uint64_t size;
+            Segment kind;
+        } ranges[] = {
+            {plugin.info.text, plugin.info.text_size, Segment::Text},
+            {plugin.info.ro, plugin.info.ro_size, Segment::Ro},
+            {plugin.info.data, plugin.info.data_size, Segment::Data},
+        };
+
+        for (const auto& range : ranges) {
+            if (!range.size || range.offset > UINT64_MAX - plugin.base)
+                continue;
+
+            const uint64_t begin = plugin.base + range.offset;
+            if (dst >= begin && dst - begin <= range.size &&
+                requested_size <= range.size - (dst - begin)) {
+                owner = &plugin;
+                segment = range.kind;
+                segment_offset = dst - begin;
+                break;
+            }
+        }
+
+        if (owner)
+            break;
+    }
+
+    if (!owner) {
+        reject("destination is not wholly inside a loaded plugin text/ro/data segment");
+        return;
+    }
+
+    const bool is_data = segment == Segment::Data;
+    if (!guest_range_ok(dst, size, is_data ? 3 : 1)) {
+        reject(is_data
+            ? "data destination is not writable"
+            : "text/ro destination is not readable");
+        return;
+    }
+
+    uint8_t before[16]{};
+    uint8_t after[16]{};
+    const size_t preview_size = std::min<size_t>(size, sizeof(before));
+    std::memcpy(before, reinterpret_cast<const void*>(dst), preview_size);
+
+    if (g_skyline_hook_mode != SkylineHookMode::Full) {
+        c.x[0] = 1;
+        if (emit)
+            log("skyline: sky_memcpy #%llu mode=%s no-write module=%s segment=%s+%llx size=%llu caller=%s",
+                (unsigned long long)event, skyline_hook_mode_name(),
+                owner->name.c_str(),
+                segment == Segment::Text ? "text" :
+                    segment == Segment::Ro ? "ro" : "data",
+                (unsigned long long)segment_offset,
+                (unsigned long long)requested_size,
+                describe(caller).c_str());
+        return;
+    }
+
+    bool used_rwx = false;
+    bool success = false;
+
+    if (is_data) {
+        std::memcpy(reinterpret_cast<void*>(dst),
+                    reinterpret_cast<const void*>(src), size);
+        success = true;
+    } else {
+        success = nce::write_code_checked(
+            dst, reinterpret_cast<const void*>(src), size,
+            segment == Segment::Text, &used_rwx);
+    }
+
+    if (!success) {
+        reject("could not obtain temporary write permission");
+        return;
+    }
+
+    std::memcpy(after, reinterpret_cast<const void*>(dst), preview_size);
+    c.x[0] = 0;
+
+    if (emit) {
+        char before_hex[16 * 3 + 1]{};
+        char after_hex[16 * 3 + 1]{};
+        for (size_t i = 0; i < preview_size; ++i) {
+            std::snprintf(before_hex + i * 3,
+                sizeof(before_hex) - i * 3, "%02x%s",
+                before[i], i + 1 < preview_size ? " " : "");
+            std::snprintf(after_hex + i * 3,
+                sizeof(after_hex) - i * 3, "%02x%s",
+                after[i], i + 1 < preview_size ? " " : "");
+        }
+
+        log("skyline: sky_memcpy #%llu module=%s segment=%s+%llx size=%llu "
+            "write=%s before=[%s] after=[%s] caller=%s",
+            (unsigned long long)event, owner->name.c_str(),
+            segment == Segment::Text ? "text" :
+                segment == Segment::Ro ? "ro" : "data",
+            (unsigned long long)segment_offset,
+            (unsigned long long)requested_size,
+            is_data ? "data-memcpy" : (used_rwx ? "RWX" : "RW-fallback"),
+            before_hex, after_hex, describe(caller).c_str());
+    }
+}
+
+
 static void skyline_tcp_send_raw(CPU& c) {
     static uint64_t sequence = 0;
     const uint64_t address = c.x[0];
     const uint64_t requested_length = c.x[1];
     const uint64_t write_sequence = ++sequence;
+    static uint64_t marker_log_count = 0;
+    const uint64_t marker_event = ++marker_log_count;
+    const bool emit_marker = marker_event <= 200 || marker_event % 1000 == 0;
     constexpr size_t kMaxLogBytes = 1024;
 
     const size_t count = static_cast<size_t>(
@@ -453,10 +605,11 @@ static void skyline_tcp_send_raw(CPU& c) {
     );
 
     if (count && !guest_range_ok(address, count, 1)) {
-        log("skyline: TCP write #%llu buffer=%llx length=%llu unreadable",
-            (unsigned long long)write_sequence,
-            (unsigned long long)address,
-            (unsigned long long)requested_length);
+        if (emit_marker)
+            log("skyline: TCP write #%llu buffer=%llx length=%llu unreadable",
+                (unsigned long long)write_sequence,
+                (unsigned long long)address,
+                (unsigned long long)requested_length);
         return;
     }
 
@@ -479,13 +632,14 @@ static void skyline_tcp_send_raw(CPU& c) {
             ? static_cast<char>(ch) : '.';
     }
 
-    log("skyline: TCP write #%llu buffer=%llx length=%llu read=%zu "
-        "preview_hex=[%s] preview_ascii=\"%s\"%s",
-        (unsigned long long)write_sequence,
-        (unsigned long long)address,
-        (unsigned long long)requested_length,
-        count, hex, ascii,
-        requested_length > kMaxLogBytes ? " (truncated at 1024 bytes)" : "");
+    if (emit_marker)
+        log("skyline: TCP write #%llu buffer=%llx length=%llu read=%zu "
+            "preview_hex=[%s] preview_ascii=\"%s\"%s",
+            (unsigned long long)write_sequence,
+            (unsigned long long)address,
+            (unsigned long long)requested_length,
+            count, hex, ascii,
+            requested_length > kMaxLogBytes ? " (truncated at 1024 bytes)" : "");
 
     size_t printable_count = count;
     while (printable_count &&
@@ -502,7 +656,8 @@ static void skyline_tcp_send_raw(CPU& c) {
             ch >= 0x20 && ch <= 0x7e ? static_cast<char>(ch) : '.'
         );
     }
-    log("plugin: %s", sanitized.c_str());
+    if (emit_marker)
+        log("plugin: %s", sanitized.c_str());
 }
 static void skyline_a64_hook_function(CPU& c) {
     ++g_skyline_function_hook_requests;
@@ -756,6 +911,7 @@ static void skyline_a64_inline_hook(CPU& c) {
 }
 
 NX_HLE("getRegionAddress", skyline_get_region);
+NX_HLE("sky_memcpy", skyline_memcpy);
 NX_HLE("skyline_tcp_send_raw", skyline_tcp_send_raw);
 NX_HLE("A64HookFunction", skyline_a64_hook_function);
 NX_HLE("A64InlineHook", skyline_a64_inline_hook);
