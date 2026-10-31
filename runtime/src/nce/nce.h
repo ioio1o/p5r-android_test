@@ -40,6 +40,8 @@ void enter(CPU& c, uint64_t target);
 // where the original function can still be called with call() (its first instruction moved, then a branch back),
 // 0 if the function's first instruction cannot be moved.
 uint64_t hook(uint64_t addr, HleFn fn);
+// Replaces a guest function with an already-validated guest address.
+uint64_t hook_guest(uint64_t addr, uint64_t replacement);
 // Installs an inline hook for a single displaced AArch64 BL instruction.
 uint64_t hook_inline(uint64_t addr, HleFn fn);
 

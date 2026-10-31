@@ -250,6 +250,66 @@ struct SkylinePluginRuntime {
 };
 
 static std::vector<std::unique_ptr<SkylinePluginRuntime>> g_skyline_plugins;
+
+static bool skyline_plugin_text_address(uint64_t address) {
+    if (!address || (address & 3))
+        return false;
+
+    for (const auto& owned : g_skyline_plugins) {
+        if (!owned)
+            continue;
+
+        const SkylinePluginRuntime& plugin = *owned;
+        const uint64_t begin = plugin.base + plugin.info.text;
+
+        if (plugin.info.text_size &&
+            address >= begin &&
+            address - begin < plugin.info.text_size &&
+            guest_range_ok(address, sizeof(uint32_t), 1))
+            return true;
+    }
+    return false;
+}
+
+static bool skyline_plugin_allowed(const std::string& filename) {
+    static bool loaded = false;
+    static std::vector<std::string> allowed;
+
+    if (!loaded) {
+        loaded = true;
+
+        const auto path =
+            std::filesystem::u8path(plat::data_root()) /
+            "p5r" / "skyline_plugins.txt";
+
+        std::ifstream file(path);
+        std::string line;
+
+        while (std::getline(file, line)) {
+            const size_t first = line.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos)
+                continue;
+
+            const size_t last = line.find_last_not_of(" \t\r\n");
+            line = line.substr(first, last - first + 1);
+
+            if (line.empty() || line[0] == '#')
+                continue;
+
+            allowed.push_back(line);
+        }
+
+        if (allowed.empty())
+            allowed.push_back("libcbt.nro");
+
+        log("skyline: plugin allowlist loaded: %zu filename(s)",
+            allowed.size());
+    }
+
+    return std::find(allowed.begin(), allowed.end(), filename)
+        != allowed.end();
+}
+
 static uint64_t g_skyline_next_slot = 0;
 static void run_skyline_plugins(CPU& c);
 
@@ -454,28 +514,51 @@ static void skyline_a64_hook_function(CPU& c) {
         skyline_hook_log_due(g_skyline_function_hook_log_count);
     const uint64_t event = g_skyline_function_hook_log_count;
 
-    if ((result_slot & 7) == 0 &&
-        guest_range_ok(result_slot, sizeof(uint64_t), 3)) {
-        std::memcpy(reinterpret_cast<void*>(result_slot),
-                    &target, sizeof(target));
-
+    if ((result_slot & 7) != 0 ||
+        !guest_range_ok(result_slot, sizeof(uint64_t), 3)) {
         if (emit)
-            log("skyline: A64HookFunction event=%llu total=%llu no-op "
-                "target=%llx replacement=%llx original returned at %llx",
+            log("skyline: A64HookFunction event=%llu invalid result slot=%llx",
                 (unsigned long long)event,
-                (unsigned long long)event,
-                (unsigned long long)target,
-                (unsigned long long)replacement,
                 (unsigned long long)result_slot);
-    } else if (emit) {
-        log("skyline: A64HookFunction event=%llu total=%llu no-op "
-            "target=%llx replacement=%llx invalid result slot=%llx",
+        return;
+    }
+
+    uint64_t original = target;
+    const char* status = "passthrough";
+
+    if (g_skyline_hook_mode == SkylineHookMode::Off) {
+        status = "disabled";
+    } else if (g_skyline_hook_mode == SkylineHookMode::Full) {
+        if (!skyline_plugin_text_address(replacement)) {
+            status = "invalid replacement";
+        } else {
+            const uint64_t trampoline =
+                nce::hook_guest(target, replacement);
+
+            if (trampoline) {
+                original = trampoline;
+                status = "installed";
+            } else {
+                status = "hook rejected";
+            }
+        }
+    }
+
+    std::memcpy(
+        reinterpret_cast<void*>(result_slot),
+        &original,
+        sizeof(original)
+    );
+
+    if (emit)
+        log("skyline: A64HookFunction event=%llu status=%s "
+            "target=%llx replacement=%llx original=%llx mode=%s",
             (unsigned long long)event,
-            (unsigned long long)event,
+            status,
             (unsigned long long)target,
             (unsigned long long)replacement,
-            (unsigned long long)result_slot);
-    }
+            (unsigned long long)original,
+            skyline_hook_mode_name());
 }
 
 
@@ -1232,6 +1315,12 @@ static void run_skyline_plugins(CPU& c) {
     skyline_load_hook_mode();
     for (const auto& owned : g_skyline_plugins) {
         SkylinePluginRuntime& plugin = *owned;
+
+        if (!skyline_plugin_allowed(plugin.name)) {
+            log("skyline: plugin skipped by allowlist: %s",
+                plugin.name.c_str());
+            continue;
+        }
 
         log("skyline: begin controlled execution of %s",
             plugin.name.c_str());

@@ -753,6 +753,167 @@ uint64_t hook(uint64_t addr, HleFn fn) {
     return original;
 }
 
+uint64_t hook_guest(uint64_t addr, uint64_t replacement) {
+    std::lock_guard lk(g_regions_lock);
+
+    const LoadedModule* m = module_at(addr);
+    if (!m) {
+        log("nce: guest hook at %llx: target is not in a loaded module",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    const uint64_t text_begin = m->base + m->info->text;
+    if ((addr & 3) || addr < text_begin ||
+        addr - text_begin >= m->info->text_size ||
+        addr > UINT64_MAX - 4 || !replacement || (replacement & 3)) {
+        log("nce: guest hook at %llx: invalid target or replacement",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    auto it = g_regions.find(m->base);
+    if (it == g_regions.end()) {
+        log("nce: guest hook at %llx: target module has no stub region",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    const uint32_t first = ld<uint32_t>(addr);
+    if (pc_relative(first)) {
+        log("nce: guest hook at %llx: first instruction %08x is PC-relative",
+            (unsigned long long)addr, first);
+        return 0;
+    }
+
+    Region& r = it->second;
+    const uint64_t start = r.cur;
+
+    if (start > UINT64_MAX - 32 || start > r.end)
+        return 0;
+
+    const uint64_t veneer = (start + 8 + 7) & ~uint64_t(7);
+    if (veneer > UINT64_MAX - 16)
+        return 0;
+
+    const uint64_t end = veneer + 16;
+    if (end > r.end || end < start)
+        return 0;
+
+    // Both B instructions must be in range before b_to() is called.
+    const auto branch_fits = [](uint64_t from, uint64_t to) {
+        if ((from & 3) || (to & 3))
+            return false;
+        if (to >= from)
+            return to - from < (uint64_t(1) << 27);
+        return from - to <= (uint64_t(1) << 27);
+    };
+
+    if (!branch_fits(addr, veneer) ||
+        !branch_fits(start + 4, addr + 4)) {
+        log("nce: guest hook at %llx: branch out of range",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    const size_t word_count = static_cast<size_t>((end - start) / 4);
+    if (!word_count || word_count > 7)
+        return 0;
+
+    uint32_t code[7];
+    for (size_t i = 0; i < word_count; ++i)
+        code[i] = kNop;
+
+    // Trampoline: execute the displaced instruction, then resume at target+4.
+    code[0] = first;
+    code[1] = b_to(start + 4, addr + 4);
+
+    // Nearby veneer: load the absolute replacement address and branch to it.
+    const size_t veneer_index =
+        static_cast<size_t>((veneer - start) / 4);
+    code[veneer_index] = 0x58000050u;     // ldr x16, [pc, #8]
+    code[veneer_index + 1] = 0xD61F0200u; // br x16
+    code[veneer_index + 2] = static_cast<uint32_t>(replacement);
+    code[veneer_index + 3] = static_cast<uint32_t>(replacement >> 32);
+
+    const uint32_t target_branch = b_to(addr, veneer);
+
+    // Make the target writable before emitting or installing anything.
+    bool target_writable =
+        protect(addr, 4, PROT_READ | PROT_WRITE | PROT_EXEC);
+    if (!target_writable)
+        target_writable = protect(addr, 4, PROT_READ | PROT_WRITE);
+
+    if (!target_writable) {
+        log("nce: guest hook at %llx: target page is not writable; unchanged",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    // The target is writable, but do not patch it unless the stub region
+    // can also be safely written and restored to executable permissions.
+    bool region_writable =
+        protect(r.base, kRegionSize,
+                PROT_READ | PROT_WRITE | PROT_EXEC);
+    if (!region_writable)
+        region_writable =
+            protect(r.base, kRegionSize, PROT_READ | PROT_WRITE);
+
+    if (!region_writable) {
+        (void)protect(addr, 4, PROT_READ | PROT_EXEC);
+        log("nce: guest hook at %llx: stub region is not writable",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    std::memcpy(
+        reinterpret_cast<void*>(start),
+        code,
+        word_count * sizeof(uint32_t)
+    );
+    clear_cache(start, word_count * sizeof(uint32_t));
+
+    if (!protect(r.base, kRegionSize, PROT_READ | PROT_EXEC)) {
+        (void)protect(addr, 4, PROT_READ | PROT_EXEC);
+        log("nce: guest hook at %llx: could not restore stub RX permissions",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    // Only now modify the target function.
+    std::memcpy(
+        reinterpret_cast<void*>(addr),
+        &target_branch,
+        sizeof(target_branch)
+    );
+    clear_cache(addr, sizeof(target_branch));
+
+    if (!protect(addr, 4, PROT_READ | PROT_EXEC)) {
+        // Roll back while the target page is still writable.
+        std::memcpy(
+            reinterpret_cast<void*>(addr),
+            &first,
+            sizeof(first)
+        );
+        clear_cache(addr, sizeof(first));
+        (void)protect(addr, 4, PROT_READ | PROT_EXEC);
+
+        log("nce: guest hook at %llx: RX restore failed; original instruction restored",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    r.cur = end;
+
+    log("nce: guest hook installed at %llx -> %llx; trampoline=%llx veneer=%llx",
+        (unsigned long long)addr,
+        (unsigned long long)replacement,
+        (unsigned long long)start,
+        (unsigned long long)veneer);
+
+    return start;
+}
+
 uint64_t hook_inline(uint64_t addr, HleFn fn) {
     std::lock_guard lk(g_regions_lock);
     const LoadedModule* m = module_at(addr);
