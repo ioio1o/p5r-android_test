@@ -477,6 +477,8 @@ static void skyline_memcpy(CPU& c) {
     enum class Segment { None, Text, Ro, Data };
     Segment segment = Segment::None;
     const SkylinePluginRuntime* owner = nullptr;
+    std::string owner_name;
+    bool main_owner = false;
     uint64_t segment_offset = 0;
 
     for (const auto& owned : g_skyline_plugins) {
@@ -509,6 +511,7 @@ static void skyline_memcpy(CPU& c) {
             if (dst >= begin && dst - begin <= range.size &&
                 requested_size <= range.size - (dst - begin)) {
                 owner = &plugin;
+                owner_name = plugin.name;
                 segment = range.kind;
                 segment_offset = dst - begin;
                 break;
@@ -519,8 +522,50 @@ static void skyline_memcpy(CPU& c) {
             break;
     }
 
-    if (!owner) {
-        reject("destination is not wholly inside a loaded plugin text/ro/data segment");
+    // Also accept validated destinations inside the main game module.
+    // The loader maps main data through the page-aligned end of BSS.
+    if (!owner && g_main) {
+        uint64_t mapped_end = 0;
+
+        if (g_main->bss <= UINT64_MAX - g_main->bss_size) {
+            const uint64_t bss_end = g_main->bss + g_main->bss_size;
+
+            if (bss_end <= UINT64_MAX - 0xFFF)
+                mapped_end = (bss_end + 0xFFF) & ~uint64_t(0xFFF);
+        }
+
+        if (mapped_end >= g_main->data) {
+            const struct {
+                uint64_t offset;
+                uint64_t size;
+                Segment kind;
+            } ranges[] = {
+                {g_main->text, g_main->text_size, Segment::Text},
+                {g_main->ro, g_main->ro_size, Segment::Ro},
+                {g_main->data, mapped_end - g_main->data, Segment::Data},
+            };
+
+            for (const auto& range : ranges) {
+                if (!range.size ||
+                    range.offset > UINT64_MAX - g_main->base)
+                    continue;
+
+                const uint64_t begin = g_main->base + range.offset;
+
+                if (dst >= begin && dst - begin <= range.size &&
+                    requested_size <= range.size - (dst - begin)) {
+                    main_owner = true;
+                    owner_name = "main";
+                    segment = range.kind;
+                    segment_offset = dst - begin;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!owner && !main_owner) {
+        reject("destination is not wholly inside a loaded plugin or main-module segment");
         return;
     }
 
@@ -542,7 +587,7 @@ static void skyline_memcpy(CPU& c) {
         if (emit)
             log("skyline: sky_memcpy #%llu mode=%s no-write module=%s segment=%s+%llx size=%llu caller=%s",
                 (unsigned long long)event, skyline_hook_mode_name(),
-                owner->name.c_str(),
+                owner_name.c_str(),
                 segment == Segment::Text ? "text" :
                     segment == Segment::Ro ? "ro" : "data",
                 (unsigned long long)segment_offset,
@@ -586,7 +631,7 @@ static void skyline_memcpy(CPU& c) {
 
         log("skyline: sky_memcpy #%llu module=%s segment=%s+%llx size=%llu "
             "write=%s before=[%s] after=[%s] caller=%s",
-            (unsigned long long)event, owner->name.c_str(),
+            (unsigned long long)event, owner_name.c_str(),
             segment == Segment::Text ? "text" :
                 segment == Segment::Ro ? "ro" : "data",
             (unsigned long long)segment_offset,
