@@ -881,6 +881,120 @@ static void skyline_inline_hook_callback(CPU& c) {
             (unsigned long long)continuation,
             (unsigned long long)original_sp);
 }
+
+struct SkylineGenericInlineHook {
+    uint64_t target;
+    uint64_t continuation;
+    uint64_t replacement;
+};
+
+static SkylineGenericInlineHook g_skyline_generic_inline_hooks[64]{};
+static uint32_t g_skyline_generic_inline_hook_count = 0;
+
+static void skyline_generic_inline_hook_callback(CPU& c) {
+    const uint64_t continuation = c.x[30];
+    const uint64_t saved_stack_sp = c.x[31];
+
+    uint64_t replacement = 0;
+    for (uint32_t i = 0; i < g_skyline_generic_inline_hook_count; ++i) {
+        if (g_skyline_generic_inline_hooks[i].continuation == continuation) {
+            replacement = g_skyline_generic_inline_hooks[i].replacement;
+            break;
+        }
+    }
+
+    const bool emit =
+        skyline_hook_log_due(g_skyline_inline_callback_log_count);
+    const uint64_t event = g_skyline_inline_callback_log_count;
+
+    if (!replacement || !continuation) {
+        if (emit)
+            log("skyline: generic inline callback event=%llu: missing metadata; resume=%llx",
+                (unsigned long long)event,
+                (unsigned long long)continuation);
+        return;
+    }
+
+    if (g_skyline_hook_mode != SkylineHookMode::Full) {
+        if (emit)
+            log("skyline: generic inline callback event=%llu: passthrough resume=%llx",
+                (unsigned long long)event,
+                (unsigned long long)continuation);
+        return;
+    }
+
+    if (saved_stack_sp > UINT64_MAX - 16) {
+        if (emit)
+            log("skyline: generic inline callback event=%llu: invalid saved SP",
+                (unsigned long long)event);
+        return;
+    }
+
+    // The trampoline pushed the original LR at [saved_stack_sp].
+    // Read it before the InlineCtx is placed below the interrupted SP.
+    uint64_t original_x30 = 0;
+    std::memcpy(&original_x30,
+                reinterpret_cast<const void*>(saved_stack_sp),
+                sizeof(original_x30));
+
+    const uint64_t original_sp = saved_stack_sp + 16;
+
+    struct alignas(16) InlineCtx {
+        uint64_t x[31];
+        uint64_t sp;
+        V128 v[32];
+    };
+    static_assert(sizeof(InlineCtx) == 0x300);
+
+    if (original_sp < sizeof(InlineCtx)) {
+        if (emit)
+            log("skyline: generic inline callback event=%llu: invalid guest SP=%llx",
+                (unsigned long long)event,
+                (unsigned long long)original_sp);
+        return;
+    }
+
+    const uint64_t context_address =
+        (original_sp - sizeof(InlineCtx)) & ~uint64_t(0xF);
+    auto* context = reinterpret_cast<InlineCtx*>(context_address);
+
+    std::memcpy(context->x, c.x, sizeof(context->x));
+    context->x[30] = original_x30;
+    context->sp = original_sp;
+    std::memcpy(context->v, c.v, sizeof(context->v));
+
+    c.x[0] = context_address;
+    c.x[31] = context_address;
+
+    if (emit)
+        log("skyline: generic inline callback event=%llu: calling replacement=%llx ctx=%llx original_lr=%llx",
+            (unsigned long long)event,
+            (unsigned long long)replacement,
+            (unsigned long long)context_address,
+            (unsigned long long)original_x30);
+
+    call(c, replacement);
+
+    // Apply edits to x0-x29 and all vector registers. The replacement's
+    // SP and LR edits are deliberately ignored for this trampoline type.
+    std::memcpy(c.x, context->x, 30 * sizeof(uint64_t));
+    std::memcpy(c.v, context->v, sizeof(context->v));
+
+    // InlineCtx overlaps the trampoline's saved LR slot. Restore it so
+    // the continuation's ldr x30, [sp], #16 gets the original value.
+    std::memcpy(reinterpret_cast<void*>(saved_stack_sp),
+                &original_x30, sizeof(original_x30));
+
+    c.x[30] = continuation;
+    c.x[31] = saved_stack_sp;
+
+    if (emit)
+        log("skyline: generic inline callback event=%llu: replacement returned; resume=%llx restored_sp=%llx",
+            (unsigned long long)event,
+            (unsigned long long)continuation,
+            (unsigned long long)saved_stack_sp);
+}
+
 static void skyline_a64_inline_hook(CPU& c) {
     ++g_skyline_inline_hook_requests;
 
@@ -895,18 +1009,24 @@ static void skyline_a64_inline_hook(CPU& c) {
 
     if (g_skyline_hook_mode == SkylineHookMode::Off) {
         if (emit)
-            log("skyline: A64InlineHook event=%llu total=%llu "
-                "mode=off; not installing target=%llx",
+            log("skyline: A64InlineHook event=%llu total=%llu mode=off; not installing target=%llx",
                 (unsigned long long)event,
                 (unsigned long long)event,
                 (unsigned long long)target);
         return;
     }
 
+    if (!replacement || !target) {
+        if (emit)
+            log("skyline: A64InlineHook event=%llu total=%llu refused invalid target/replacement",
+                (unsigned long long)event,
+                (unsigned long long)event);
+        return;
+    }
+
     if (g_main && target == g_main->base + 0x102603c) {
         if (emit)
-            log("skyline: A64InlineHook event=%llu total=%llu "
-                "skip known BLR site target=%llx replacement=%llx",
+            log("skyline: A64InlineHook event=%llu total=%llu skip known BLR site target=%llx replacement=%llx",
                 (unsigned long long)event,
                 (unsigned long long)event,
                 (unsigned long long)target,
@@ -914,11 +1034,11 @@ static void skyline_a64_inline_hook(CPU& c) {
         return;
     }
 
+    // Preserve the existing BL hook and its callback unchanged.
     if (g_main && target == g_main->base + 0x8a9134) {
-        if (!replacement || g_skyline_inline_continuation) {
+        if (g_skyline_inline_continuation) {
             if (emit)
-                log("skyline: A64InlineHook event=%llu total=%llu "
-                    "refused target=%llx: invalid replacement or already installed",
+                log("skyline: A64InlineHook event=%llu total=%llu refused BL target=%llx: already installed",
                     (unsigned long long)event,
                     (unsigned long long)event,
                     (unsigned long long)target);
@@ -932,10 +1052,8 @@ static void skyline_a64_inline_hook(CPU& c) {
         if (continuation) {
             g_skyline_inline_continuation = continuation;
             ++g_skyline_inline_hooks_installed;
-
             if (emit)
-                log("skyline: A64InlineHook event=%llu total=%llu "
-                    "installed target=%llx replacement=%llx continuation=%llx",
+                log("skyline: A64InlineHook event=%llu total=%llu installed BL target=%llx replacement=%llx continuation=%llx",
                     (unsigned long long)event,
                     (unsigned long long)event,
                     (unsigned long long)target,
@@ -944,8 +1062,7 @@ static void skyline_a64_inline_hook(CPU& c) {
         } else {
             g_skyline_inline_replacement = 0;
             if (emit)
-                log("skyline: A64InlineHook event=%llu total=%llu "
-                    "failed to install target=%llx",
+                log("skyline: A64InlineHook event=%llu total=%llu failed to install BL target=%llx",
                     (unsigned long long)event,
                     (unsigned long long)event,
                     (unsigned long long)target);
@@ -953,13 +1070,54 @@ static void skyline_a64_inline_hook(CPU& c) {
         return;
     }
 
-    if (emit)
-        log("skyline: A64InlineHook event=%llu total=%llu "
-            "no-op unsupported target=%llx replacement=%llx",
+    if (g_skyline_generic_inline_hook_count >=
+        sizeof(g_skyline_generic_inline_hooks) /
+            sizeof(g_skyline_generic_inline_hooks[0])) {
+        if (emit)
+            log("skyline: A64InlineHook event=%llu total=%llu generic hook metadata capacity exceeded",
+                (unsigned long long)event,
+                (unsigned long long)event);
+        return;
+    }
+
+    for (uint32_t i = 0; i < g_skyline_generic_inline_hook_count; ++i) {
+        if (g_skyline_generic_inline_hooks[i].target == target) {
+            if (emit)
+                log("skyline: A64InlineHook event=%llu total=%llu duplicate generic target=%llx",
+                    (unsigned long long)event,
+                    (unsigned long long)event,
+                    (unsigned long long)target);
+            return;
+        }
+    }
+
+    const uint64_t continuation =
+        nce::hook_inline_instruction(
+            target, skyline_generic_inline_hook_callback);
+
+    if (continuation) {
+        auto& entry =
+            g_skyline_generic_inline_hooks[
+                g_skyline_generic_inline_hook_count++];
+        entry.target = target;
+        entry.continuation = continuation;
+        entry.replacement = replacement;
+
+        ++g_skyline_inline_hooks_installed;
+        if (emit)
+            log("skyline: A64InlineHook event=%llu total=%llu installed generic target=%llx replacement=%llx continuation=%llx",
+                (unsigned long long)event,
+                (unsigned long long)event,
+                (unsigned long long)target,
+                (unsigned long long)replacement,
+                (unsigned long long)continuation);
+    } else if (emit) {
+        log("skyline: A64InlineHook event=%llu total=%llu generic hook rejected target=%llx replacement=%llx",
             (unsigned long long)event,
             (unsigned long long)event,
             (unsigned long long)target,
             (unsigned long long)replacement);
+    }
 }
 
 NX_HLE("getRegionAddress", skyline_get_region);

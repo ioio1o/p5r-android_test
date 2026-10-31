@@ -49,6 +49,7 @@ uint64_t hook(uint64_t addr, HleFn fn);
 uint64_t hook_guest(uint64_t addr, uint64_t replacement);
 // Installs an inline hook for a single displaced AArch64 BL instruction.
 uint64_t hook_inline(uint64_t addr, HleFn fn);
+uint64_t hook_inline_instruction(uint64_t addr, HleFn fn);
 
 // The Switch's 19.2 MHz system tick, from the host's virtual counter (what the patched mrs CNTPCT_EL0 returns).
 uint64_t tick();

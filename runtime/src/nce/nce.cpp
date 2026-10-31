@@ -1063,6 +1063,139 @@ if (!protect(r.base, kRegionSize, PROT_READ | PROT_WRITE | PROT_EXEC))
 
     return continuation;
 }
+
+uint64_t hook_inline_instruction(uint64_t addr, HleFn fn) {
+    std::lock_guard lk(g_regions_lock);
+
+    const LoadedModule* m = module_at(addr);
+    auto it = m ? g_regions.find(m->base) : g_regions.end();
+
+    if (!fn || it == g_regions.end() ||
+        addr < m->base + m->info->text ||
+        addr - (m->base + m->info->text) >= m->info->text_size) {
+        log("nce: generic inline hook at %llx: not in a module's code",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    if (addr & 3) {
+        log("nce: generic inline hook at %llx: unaligned target",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    const uint32_t displaced = ld<uint32_t>(addr);
+    if (pc_relative(displaced)) {
+        log("nce: generic inline hook at %llx: PC-relative instruction %08x rejected",
+            (unsigned long long)addr, displaced);
+        return 0;
+    }
+
+    const uint32_t index = g_hook_count.load();
+    if (index >= kMaxHooks) {
+        log("nce: generic inline hook at %llx: hook capacity exceeded",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    Region& r = it->second;
+    const uint64_t from = r.cur;
+
+    // Six stub instructions and three continuation instructions.
+    constexpr uint64_t kGenericInlineBytes = 9 * sizeof(uint32_t);
+
+    if (r.failed || r.cur > r.end ||
+        r.end - r.cur < kGenericInlineBytes) {
+        log("nce: generic inline hook at %llx: trampoline region exhausted",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    const uint64_t stub = r.cur;
+    const uint64_t continuation = stub + 6 * sizeof(uint32_t);
+
+    auto branch_fits = [](uint64_t from, uint64_t to) {
+        if ((from & 3) || (to & 3))
+            return false;
+        const __int128 d = (__int128)to - (__int128)from;
+        return d >= -((__int128)1 << 27) &&
+               d <  ((__int128)1 << 27);
+    };
+
+    auto adr_fits = [](uint64_t from, uint64_t to) {
+        const __int128 d = (__int128)to - (__int128)from;
+        return d >= -((__int128)1 << 20) &&
+               d <  ((__int128)1 << 20);
+    };
+
+    if (!branch_fits(addr, stub) ||
+        !branch_fits(stub + 20, r.common) ||
+        !branch_fits(continuation + 8, addr + 4) ||
+        !adr_fits(stub + 16, continuation)) {
+        log("nce: generic inline hook at %llx: branch or ADR out of range",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    const bool rwx = protect(r.base, kRegionSize,
+                             PROT_READ | PROT_WRITE | PROT_EXEC);
+    if (!rwx && !protect(r.base, kRegionSize,
+                         PROT_READ | PROT_WRITE)) {
+        log("nce: generic inline hook at %llx: cannot make trampoline writable",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    // Preserve the original LR on the guest stack, then save x16/x17.
+    r.emit(0xF81F0FFEu);                 // str x30, [sp, #-16]!
+    r.emit(kPushX16X17);
+    r.emit(movz_w16(index));
+    r.emit(movk_w16_hi(0x4000));
+    r.emit(adr_to(r.cur, continuation, 30));
+    r.emit(b_to(r.cur, r.common));
+
+    // Restore original LR and SP, execute the displaced instruction,
+    // then return to the instruction immediately following the hook.
+    r.emit(0xF84107FEu);                 // ldr x30, [sp], #16
+    r.emit(displaced);
+    r.emit(b_to(r.cur, addr + 4));
+
+    if (r.failed) {
+        r.cur = from;
+        protect(r.base, kRegionSize, PROT_READ | PROT_EXEC);
+        log("nce: generic inline hook at %llx: trampoline emission failed",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    if (!protect(r.base, kRegionSize, PROT_READ | PROT_EXEC)) {
+        r.cur = from;
+        log("nce: generic inline hook at %llx: cannot restore trampoline RX protection",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    clear_cache(from, r.cur - from);
+
+    const uint32_t branch = b_to(addr, stub);
+    if (!write_code_checked(addr, &branch, sizeof(branch), true, nullptr)) {
+        r.cur = from;
+        log("nce: generic inline hook at %llx: target patch failed",
+            (unsigned long long)addr);
+        return 0;
+    }
+
+    g_hooks[index] = fn;
+    g_hook_count.store(index + 1);
+
+    log("nce: generic inline hook installed at %llx: instruction=%08x stub=%llx continuation=%llx",
+        (unsigned long long)addr, displaced,
+        (unsigned long long)stub,
+        (unsigned long long)continuation);
+
+    return continuation;
+}
+
 uint64_t tick() { return scaled(cntvct()) - g_tick_off; }
 
 bool guest_fault_context(void* ucontext, CPU& c, uint64_t& pc) {
