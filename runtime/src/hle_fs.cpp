@@ -39,6 +39,27 @@ bool trace_fs() {
     return on;
 }
 
+bool sd_fs_log_due() {
+    static uint64_t total = 0;
+    ++total;
+    return total <= 20 || total % 10000 == 0;
+}
+
+struct SdFsCallTrace {
+    const char* operation;
+    std::string path;
+    CPU& cpu;
+    uint64_t count = 0;
+
+    ~SdFsCallTrace() {
+        if (path.rfind("sd:", 0) == 0 && sd_fs_log_due())
+            log("fs: sd %s path=%s result=0x%llx count=%llu",
+                operation, path.c_str(),
+                (unsigned long long)cpu.x[0],
+                (unsigned long long)count);
+    }
+};
+
 // The last opens, newest last: a crash report that says what was being loaded (log_recent_files, read by the crash
 // handlers; try_lock there, a handler must not wait for a thread that holds the lock).
 constexpr size_t kRecentOps = 24;
@@ -105,6 +126,7 @@ const std::string* find_virtual(const fs::path& resolved) {
 struct Dir {
     std::vector<fs::directory_entry> entries;
     std::vector<std::pair<std::string, nxi::GameImage::Entry>> image;  // a folder of the game image's RomFS
+    std::string path;
     bool from_image = false;
     size_t pos = 0;
     size_t count() const { return from_image ? image.size() : entries.size(); }
@@ -330,16 +352,19 @@ void CreateDirectory(CPU& c) {
 
 void GetEntryType(CPU& c) {  // (DirectoryEntryType* out, path)
     std::lock_guard lk(g_fs);
-    fs::path p = resolve(cstr(c.x[1]));
+    SdFsCallTrace trace{"GetEntryType", cstr(c.x[1]), c};
+    fs::path p = resolve(trace.path);
     if (find_virtual(p)) {
         st<uint32_t>(c.x[0], 1);
+        trace.count = 1;
         c.x[0] = kOk;
         return;
     }
     if (std::string rel; image_rel(cstr(c.x[1]), rel)) {
         if (!mod_file(rel).empty()) {
             st<uint32_t>(c.x[0], 1);
-            c.x[0] = kOk;
+            trace.count = 1;
+        c.x[0] = kOk;
             return;
         }
         const nxi::GameImage::Entry* e = game_image()->find(rel);
@@ -354,12 +379,14 @@ void GetEntryType(CPU& c) {  // (DirectoryEntryType* out, path)
         return;
     }
     st<uint32_t>(c.x[0], fs::is_directory(p) ? 0 : 1);
-    c.x[0] = kOk;
+    trace.count = 1;
+        c.x[0] = kOk;
 }
 
 void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4 append)
     std::lock_guard lk(g_fs);
     std::string guest = cstr(c.x[1]);
+    SdFsCallTrace trace{"OpenFile", guest, c};
     fs::path p = resolve(guest);
     int mode = int(c.x[2]);
     if (const std::string* v = find_virtual(p)) {  // served from memory, through a temporary file
@@ -374,7 +401,8 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
         g_files[h] = std::make_shared<File>(f, guest);
         st<uint64_t>(c.x[0], h);
         note_open("OpenFile", guest, "virtual");
-        if (trace_fs() || guest.rfind("sd:", 0) == 0) log("fs: OpenFile(%s) -> virtual, %zu bytes", guest.c_str(), v->size());
+        if (trace_fs()) log("fs: OpenFile(%s) -> virtual, %zu bytes", guest.c_str(), v->size());
+        trace.count = 1;
         c.x[0] = kOk;
         return;
     }
@@ -386,14 +414,15 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
                 st<uint64_t>(c.x[0], h);
                 note_open("OpenFile", guest, "ok (mod)");
                 log("fs: mod file %s", rel.c_str());
-                c.x[0] = kOk;
+                trace.count = 1;
+        c.x[0] = kOk;
                 return;
             }
         }
         const nxi::GameImage::Entry* e = game_image()->find(rel);
         if (!e || e->dir) {
             note_open("OpenFile", guest, "not in the game file");
-            if (trace_fs() || guest.rfind("sd:", 0) == 0) log("fs: OpenFile(%s) not found in the game file", guest.c_str());
+            if (trace_fs()) log("fs: OpenFile(%s) not found in the game file", guest.c_str());
             c.x[0] = kPathNotFound;
             return;
         }
@@ -401,21 +430,22 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
         g_files[h] = std::make_shared<File>(e, guest);
         st<uint64_t>(c.x[0], h);
         note_open("OpenFile", guest, "ok (game file)");
-        if (trace_fs() || guest.rfind("sd:", 0) == 0) log("fs: OpenFile(%s, %d) -> %llu (game file)", guest.c_str(), mode, (unsigned long long)h);
+        if (trace_fs()) log("fs: OpenFile(%s, %d) -> %llu (game file)", guest.c_str(), mode, (unsigned long long)h);
+        trace.count = 1;
         c.x[0] = kOk;
         return;
     }
     std::error_code ec;
     if (p.empty() || !fs::is_regular_file(p, ec)) {
         note_open("OpenFile", guest, p.empty() ? "unknown mount" : "not found");
-        if (trace_fs() || guest.rfind("sd:", 0) == 0) log("fs: OpenFile(%s) not found", guest.c_str());
+        if (trace_fs()) log("fs: OpenFile(%s) not found", guest.c_str());
         c.x[0] = kPathNotFound;
         return;
     }
     FILE* f = plat::fopen_utf8(utf8(p), (mode & 2) ? "r+b" : "rb");
     if (!f) {
         note_open("OpenFile", guest, "the host could not open it");
-        if (trace_fs() || guest.rfind("sd:", 0) == 0) log("fs: OpenFile(%s) failed to open on the host (errno %d)", guest.c_str(), errno);
+        if (trace_fs()) log("fs: OpenFile(%s) failed to open on the host (errno %d)", guest.c_str(), errno);
         c.x[0] = kPathNotFound;
         return;
     }
@@ -423,8 +453,9 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
     g_files[h] = std::make_shared<File>(f, guest);
     st<uint64_t>(c.x[0], h);
     note_open("OpenFile", guest, "ok");
-    if (trace_fs() || guest.rfind("sd:", 0) == 0) log("fs: OpenFile(%s, %d) -> %llu", guest.c_str(), mode, (unsigned long long)h);
-    c.x[0] = kOk;
+    if (trace_fs()) log("fs: OpenFile(%s, %d) -> %llu", guest.c_str(), mode, (unsigned long long)h);
+    trace.count = 1;
+        c.x[0] = kOk;
 }
 
 std::shared_ptr<File> open_file(uint64_t h) {
@@ -464,7 +495,7 @@ uint64_t read_at(const File& file, int64_t off, uint64_t buf, uint64_t size) {
     uint64_t n = file.entry ? game_image()->read(*file.entry, uint64_t(off), reinterpret_cast<void*>(buf), size)
                             : plat::read_at(file.f, off, reinterpret_cast<void*>(buf), size);
     uint64_t ms = (plat::monotonic_ns() - t0) / 1'000'000;
-    if (g_trace || file.path.rfind("sd:", 0) == 0) log("fs: read %s at %lld size %llu -> %llu", file.path.c_str(), (long long)off, (unsigned long long)size,
+    if (trace_fs()) log("fs: read %s at %lld size %llu -> %llu", file.path.c_str(), (long long)off, (unsigned long long)size,
                      (unsigned long long)n);
     if (trace_fs() && file.path.find(".bwav") != std::string::npos) {  // streamed audio: is it being consumed?
         static std::mutex m;
@@ -485,7 +516,10 @@ void ReadFileOut(CPU& c) {  // (size_t* out, FileHandle, s64 off, void* buf, siz
         c.x[0] = kTargetNotFound;
         return;
     }
-    st<uint64_t>(c.x[0], read_at(*file, int64_t(c.x[2]), c.x[3], c.x[4]));
+    SdFsCallTrace trace{"ReadFile", file->path, c};
+    const uint64_t out = c.x[0];
+    trace.count = read_at(*file, int64_t(c.x[2]), c.x[3], c.x[4]);
+    st<uint64_t>(out, trace.count);
     c.x[0] = kOk;
 }
 
@@ -495,7 +529,8 @@ void ReadFile(CPU& c) {  // (FileHandle, s64 off, void* buf, size_t size)
         c.x[0] = kTargetNotFound;
         return;
     }
-    read_at(*file, int64_t(c.x[1]), c.x[2], c.x[3]);
+    SdFsCallTrace trace{"ReadFile", file->path, c};
+    trace.count = read_at(*file, int64_t(c.x[1]), c.x[2], c.x[3]);
     c.x[0] = kOk;
 }
 
@@ -524,7 +559,9 @@ void FlushFile(CPU& c) {
 
 void OpenDirectory(CPU& c) {  // (DirectoryHandle* out, path, int mode: 1 dirs, 2 files)
     std::lock_guard lk(g_fs);
-    fs::path p = resolve(cstr(c.x[1]));
+    const std::string guest = cstr(c.x[1]);
+    SdFsCallTrace trace{"OpenDirectory", guest, c};
+    fs::path p = resolve(guest);
     int mode = int(c.x[2]);
     if (std::string rel; image_rel(cstr(c.x[1]), rel)) {
         const nxi::GameImage::Entry* e = game_image()->find(rel);
@@ -535,6 +572,7 @@ void OpenDirectory(CPU& c) {  // (DirectoryHandle* out, path, int mode: 1 dirs, 
             return;
         }
         Dir d;
+        d.path = guest;
         d.from_image = true;
         // The game's folder merged with the same folder of each mod (a mod's file wins; new names are added).
         std::vector<std::pair<std::string, nxi::GameImage::Entry>> all;
@@ -561,6 +599,7 @@ void OpenDirectory(CPU& c) {  // (DirectoryHandle* out, path, int mode: 1 dirs, 
         }
         for (auto& kid : all)
             if ((kid.second.dir && (mode & 1)) || (!kid.second.dir && (mode & 2))) d.image.push_back(kid);
+        trace.count = d.count();
         uint64_t h = g_next++;
         g_dirs[h] = std::move(d);
         st<uint64_t>(c.x[0], h);
@@ -576,10 +615,12 @@ void OpenDirectory(CPU& c) {  // (DirectoryHandle* out, path, int mode: 1 dirs, 
         return;
     }
     Dir d;
+    d.path = guest;
     for (auto& e : fs::directory_iterator(p, ec)) {
         bool dir = e.is_directory();
         if ((dir && (mode & 1)) || (!dir && (mode & 2))) d.entries.push_back(e);
     }
+    trace.count = d.count();
     uint64_t h = g_next++;
     g_dirs[h] = std::move(d);
     st<uint64_t>(c.x[0], h);
@@ -594,6 +635,7 @@ void ReadDirectory(CPU& c) {  // (s64* out_count, DirectoryEntry* entries, Direc
         return;
     }
     Dir& d = it->second;
+    SdFsCallTrace trace{"ReadDirectory", d.path, c};
     int64_t n = 0, max = int64_t(c.x[3]);
     for (; d.from_image && n < max && d.pos < d.image.size(); n++, d.pos++) {
         const auto& [name, e] = d.image[d.pos];
@@ -614,6 +656,7 @@ void ReadDirectory(CPU& c) {  // (s64* out_count, DirectoryEntry* entries, Direc
         st<int8_t>(out + 0x304, dir ? 0 : 1);
         st<int64_t>(out + 0x308, dir ? 0 : int64_t(e.file_size()));
     }
+    trace.count = uint64_t(n);
     st<int64_t>(c.x[0], n);
     c.x[0] = kOk;
 }
@@ -621,7 +664,14 @@ void ReadDirectory(CPU& c) {  // (s64* out_count, DirectoryEntry* entries, Direc
 void GetDirectoryEntryCount(CPU& c) {  // (s64* out, DirectoryHandle)
     std::lock_guard lk(g_fs);
     auto it = g_dirs.find(c.x[1]);
-    st<int64_t>(c.x[0], it == g_dirs.end() ? 0 : int64_t(it->second.count()));
+    if (it == g_dirs.end()) {
+        st<int64_t>(c.x[0], 0);
+        c.x[0] = kOk;
+        return;
+    }
+    SdFsCallTrace trace{"GetDirectoryEntryCount", it->second.path, c};
+    trace.count = it->second.count();
+    st<int64_t>(c.x[0], int64_t(trace.count));
     c.x[0] = kOk;
 }
 

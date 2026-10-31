@@ -531,37 +531,63 @@ static void skyline_inline_hook_callback(CPU& c) {
         return;
     }
 
-    // Keep InlineCtx in guest memory below the interrupted guest SP.
-    // Do not use vm_query: this stack mapping is not described by that API.
-    constexpr size_t context_size = sizeof(uint64_t) * 31;
-    if (c.x[31] < context_size) {
+    struct alignas(16) InlineCtx {
+        uint64_t x[31];
+        uint64_t sp;
+        V128 v[32];
+    };
+    static_assert(sizeof(InlineCtx) == 0x300);
+
+    const uint64_t original_sp = c.x[31];
+    if (original_sp < sizeof(InlineCtx)) {
         if (emit)
-            log("skyline: inline callback has invalid guest SP=%llx",
-                (unsigned long long)c.x[31]);
+            log("skyline: inline callback event=%llu total=%llu "
+                "invalid guest SP=%llx; passthrough",
+                (unsigned long long)event,
+                (unsigned long long)event,
+                (unsigned long long)original_sp);
         return;
     }
+
+    // The context occupies guest stack memory immediately below the
+    // interrupted SP. The replacement's own stack grows below this block.
+    // Do not use vm_query: this stack mapping is not described by that API.
     const uint64_t inline_context_address =
-        (c.x[31] - context_size) & ~uint64_t(0xF);
+        (original_sp - sizeof(InlineCtx)) & ~uint64_t(0xF);
     auto* inline_context =
-        reinterpret_cast<uint64_t*>(inline_context_address);
-    std::memcpy(inline_context, c.x, context_size);
+        reinterpret_cast<InlineCtx*>(inline_context_address);
 
-    CPU plugin_call = c;
-    plugin_call.x[0] = inline_context_address;
-    plugin_call.x[31] = inline_context_address;
+    std::memcpy(inline_context->x, c.x, sizeof(inline_context->x));
+    inline_context->sp = original_sp;
+    std::memcpy(inline_context->v, c.v, sizeof(inline_context->v));
 
-    nce::enter(plugin_call, replacement);
-
-    std::memcpy(c.x, inline_context, context_size);
+    c.x[0] = inline_context_address;
+    c.x[31] = inline_context_address;
 
     if (emit)
         log("skyline: inline callback event=%llu total=%llu "
-            "replacement returned; resume relocated BL=%llx",
+            "calling replacement=%llx ctx=%llx",
             (unsigned long long)event,
             (unsigned long long)event,
-            (unsigned long long)continuation);
-}
+            (unsigned long long)replacement,
+            (unsigned long long)inline_context_address);
 
+    call(c, replacement);
+
+    // InlineCtx edits to x0..x30 and v0..v31 are visible to the interrupted
+    // code. Its SP field is informational: restore the original guest SP.
+    std::memcpy(c.x, inline_context->x, sizeof(inline_context->x));
+    std::memcpy(c.v, inline_context->v, sizeof(inline_context->v));
+    c.x[31] = original_sp;
+
+    if (emit)
+        log("skyline: inline callback event=%llu total=%llu "
+            "replacement returned; resume relocated BL=%llx restored_sp=%llx",
+            (unsigned long long)event,
+            (unsigned long long)event,
+            (unsigned long long)continuation,
+            (unsigned long long)original_sp);
+}
 static void skyline_a64_inline_hook(CPU& c) {
     ++g_skyline_inline_hook_requests;
 
