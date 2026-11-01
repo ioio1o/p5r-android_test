@@ -595,6 +595,14 @@ std::shared_ptr<File> open_file(uint64_t h) {
 
 void CloseFile(CPU& c) {
     std::lock_guard lk(g_fs);
+    auto it = g_files.find(c.x[0]);
+    if (plugin_trace_active() && it != g_files.end())
+        log("plugin-trace fs hook=%s target=0x%llx invocation=%llu "
+            "op=CloseFile path=%s handle=%llu",
+            plugin_trace_hook(),
+            (unsigned long long)plugin_trace_target(),
+            (unsigned long long)plugin_trace_invocation(),
+            it->second->path.c_str(), (unsigned long long)c.x[0]);
     g_files.erase(c.x[0]);
 }
 
@@ -605,6 +613,13 @@ void GetFileSize(CPU& c) {  // (s64* out, FileHandle)
         return;
     }
     record_sd_size_query(file->path);
+    if (plugin_trace_active())
+        log("plugin-trace fs hook=%s target=0x%llx invocation=%llu "
+            "op=GetFileSize path=%s",
+            plugin_trace_hook(),
+            (unsigned long long)plugin_trace_target(),
+            (unsigned long long)plugin_trace_invocation(),
+            file->path.c_str());
     if (file->entry) {
         st<int64_t>(c.x[0], int64_t(file->entry->size));
         c.x[0] = kOk;
@@ -625,6 +640,14 @@ uint64_t read_at(const File& file, int64_t off, uint64_t buf, uint64_t size) {
     uint64_t n = file.entry ? game_image()->read(*file.entry, uint64_t(off), reinterpret_cast<void*>(buf), size)
                             : plat::read_at(file.f, off, reinterpret_cast<void*>(buf), size);
     uint64_t ms = (plat::monotonic_ns() - t0) / 1'000'000;
+    if (plugin_trace_active())
+        log("plugin-trace fs hook=%s target=0x%llx invocation=%llu "
+            "op=ReadFile path=%s offset=%lld requested=%llu bytes=%llu",
+            plugin_trace_hook(),
+            (unsigned long long)plugin_trace_target(),
+            (unsigned long long)plugin_trace_invocation(),
+            file.path.c_str(), (long long)off,
+            (unsigned long long)size, (unsigned long long)n);
     if (trace_fs()) log("fs: read %s at %lld size %llu -> %llu", file.path.c_str(), (long long)off, (unsigned long long)size,
                      (unsigned long long)n);
     if (trace_fs() && file.path.find(".bwav") != std::string::npos) {  // streamed audio: is it being consumed?
@@ -672,6 +695,14 @@ void WriteFile(CPU& c) {  // (FileHandle, s64 off, const void* buf, size_t size,
         c.x[0] = kTargetNotFound;
         return;
     }
+    if (plugin_trace_active())
+        log("plugin-trace fs hook=%s target=0x%llx invocation=%llu "
+            "op=WriteFile path=%s offset=%lld size=%llu",
+            plugin_trace_hook(),
+            (unsigned long long)plugin_trace_target(),
+            (unsigned long long)plugin_trace_invocation(),
+            file->path.c_str(), (long long)c.x[1],
+            (unsigned long long)c.x[3]);
     std::lock_guard lk(g_fs);
     plat::fseek64(file->f, int64_t(c.x[1]), SEEK_SET);
     fwrite(reinterpret_cast<const void*>(c.x[2]), 1, c.x[3], file->f);
@@ -681,6 +712,13 @@ void WriteFile(CPU& c) {  // (FileHandle, s64 off, const void* buf, size_t size,
 
 void FlushFile(CPU& c) {
     if (auto file = open_file(c.x[0]); file && file->f) {
+        if (plugin_trace_active())
+            log("plugin-trace fs hook=%s target=0x%llx invocation=%llu "
+                "op=FlushFile path=%s",
+                plugin_trace_hook(),
+                (unsigned long long)plugin_trace_target(),
+                (unsigned long long)plugin_trace_invocation(),
+                file->path.c_str());
         std::lock_guard lk(g_fs);
         fflush(file->f);
     }

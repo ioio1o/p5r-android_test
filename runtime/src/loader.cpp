@@ -44,6 +44,10 @@ std::unordered_map<std::string, HleFn>& registry() {
 }
 
 thread_local const char* t_missing_name = nullptr;
+thread_local const char* t_plugin_trace_hook = nullptr;
+thread_local uint64_t t_plugin_trace_target = 0;
+thread_local uint64_t t_plugin_trace_invocation = 0;
+thread_local bool t_plugin_trace_active = false;
 
 }  // namespace
 
@@ -186,11 +190,32 @@ void hle_invoke(CPU& c, size_t index) {
     if (index >= g_thunks.size()) fatal("call to an HLE thunk never handed out (%zu), lr %s", index, describe(c.x[30]).c_str());
     const Thunk& th = g_thunks[index];
     if (g_trace) log("hle %s", th.name.c_str());
+    const bool trace = plugin_trace_active();
+    const uint64_t args[6] = {
+        c.x[0], c.x[1], c.x[2], c.x[3], c.x[4], c.x[5]
+    };
     const char* prev = t_missing_name;
     t_missing_name = th.name.c_str();
     KThread* kt = self_thread();
     if (kt) kt->hle.store(t_missing_name, std::memory_order_relaxed);
     th.fn(c);
+    if (trace) {
+        log("plugin-trace hle hook=%s target=0x%llx invocation=%llu "
+            "name=%s args=[%llx,%llx,%llx,%llx,%llx,%llx] "
+            "result=[%llx,%llx]",
+            plugin_trace_hook(),
+            (unsigned long long)plugin_trace_target(),
+            (unsigned long long)plugin_trace_invocation(),
+            th.name.c_str(),
+            (unsigned long long)args[0],
+            (unsigned long long)args[1],
+            (unsigned long long)args[2],
+            (unsigned long long)args[3],
+            (unsigned long long)args[4],
+            (unsigned long long)args[5],
+            (unsigned long long)c.x[0],
+            (unsigned long long)c.x[1]);
+    }
     t_missing_name = prev;
     if (kt) kt->hle.store(prev, std::memory_order_relaxed);
 }
@@ -477,5 +502,29 @@ void load_modules(const ModuleInfo* const* mods, size_t count, const std::string
     }
 #endif
 }
+
+PluginTraceScope::PluginTraceScope(
+    const char* hook, uint64_t target, uint64_t invocation)
+    : previous_hook_(t_plugin_trace_hook),
+      previous_target_(t_plugin_trace_target),
+      previous_invocation_(t_plugin_trace_invocation),
+      previous_active_(t_plugin_trace_active) {
+    t_plugin_trace_hook = hook;
+    t_plugin_trace_target = target;
+    t_plugin_trace_invocation = invocation;
+    t_plugin_trace_active = true;
+}
+PluginTraceScope::~PluginTraceScope() {
+    t_plugin_trace_hook = previous_hook_;
+    t_plugin_trace_target = previous_target_;
+    t_plugin_trace_invocation = previous_invocation_;
+    t_plugin_trace_active = previous_active_;
+}
+bool plugin_trace_active() { return t_plugin_trace_active; }
+const char* plugin_trace_hook() {
+    return t_plugin_trace_hook ? t_plugin_trace_hook : "none";
+}
+uint64_t plugin_trace_target() { return t_plugin_trace_target; }
+uint64_t plugin_trace_invocation() { return t_plugin_trace_invocation; }
 
 }  // namespace nx

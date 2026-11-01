@@ -113,6 +113,26 @@ uint64_t hle_address_or(const char* name, HleFn fallback);  // unknown names get
 const char* hle_current_name();  // inside an HLE function: the name its thunk was made for
 HleFn hle_lookup(const char* name);
 
+// Active only while a Skyline inline replacement is executing.
+class PluginTraceScope {
+public:
+    PluginTraceScope(const char* hook, uint64_t target, uint64_t invocation);
+    ~PluginTraceScope();
+    PluginTraceScope(const PluginTraceScope&) = delete;
+    PluginTraceScope& operator=(const PluginTraceScope&) = delete;
+
+private:
+    const char* previous_hook_;
+    uint64_t previous_target_;
+    uint64_t previous_invocation_;
+    bool previous_active_;
+};
+
+bool plugin_trace_active();
+const char* plugin_trace_hook();
+uint64_t plugin_trace_target();
+uint64_t plugin_trace_invocation();
+
 // Replaces the guest function at `addr` with fn, an HLE function. Returns an address that still runs the original
 // (call(c, it)), 0 when it cannot be hooked. Recompiled builds swap its entry in the function table (the calls through
 // call(): indirect ones); native execution patches its first instruction, so every call goes to fn (nce.cpp).

@@ -1,6 +1,9 @@
 ﻿// HIPC message parsing / building, sessions, domains and the service manager (sm:).
 #include "ipc.h"
+#include <nx/runtime.h>
 
+#include <algorithm>
+#include <cstdio>
 #include <mutex>
 #include <unordered_map>
 
@@ -42,9 +45,44 @@ std::shared_ptr<Service> make_service(const std::string& name) {
 
 uint32_t Service::handle(IpcCtx& ctx) {
     auto it = cmds.find(ctx.cmd);
-    if (it != cmds.end()) return it->second(ctx);
-    log("ipc: %s cmd %u not implemented (stub ok)", name.c_str(), ctx.cmd);
-    return 0;
+    uint32_t rc = 0;
+    if (it != cmds.end()) {
+        rc = it->second(ctx);
+    } else {
+        log("ipc: %s cmd %u not implemented (stub ok)", name.c_str(), ctx.cmd);
+    }
+
+    if (plugin_trace_active()) {
+        auto hex = [](const uint8_t* data, size_t size, char* out, size_t capacity) {
+            size_t used = 0;
+            const size_t count = std::min<size_t>(size, 32);
+            for (size_t i = 0; i < count && used + 4 < capacity; ++i) {
+                const int n = std::snprintf(out + used, capacity - used,
+                    "%02x%s", data[i], i + 1 < count ? " " : "");
+                if (n <= 0) break;
+                used += size_t(n);
+            }
+            if (size > count && used + 4 < capacity)
+                std::snprintf(out + used, capacity - used, " ...");
+        };
+
+        char input_hex[128]{};
+        char output_hex[128]{};
+        if (ctx.in && ctx.in_size)
+            hex(ctx.in, ctx.in_size, input_hex, sizeof(input_hex));
+        if (!ctx.out.empty())
+            hex(ctx.out.data(), ctx.out.size(), output_hex, sizeof(output_hex));
+
+        log("plugin-trace ipc hook=%s target=0x%llx invocation=%llu "
+            "service=%s cmd=%u result=0x%08x "
+            "input_size=%zu input=[%s] output_size=%zu output=[%s]",
+            plugin_trace_hook(),
+            (unsigned long long)plugin_trace_target(),
+            (unsigned long long)plugin_trace_invocation(),
+            name.c_str(), ctx.cmd, rc,
+            ctx.in_size, input_hex, ctx.out.size(), output_hex);
+    }
+    return rc;
 }
 
 // ---- sm: ------------------------------------------------------------------------------------------------------
