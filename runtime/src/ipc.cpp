@@ -149,6 +149,8 @@ uint32_t ipc_request(CPU& c, uint32_t handle, uint64_t buf, uint64_t) {
         ctx.in = reinterpret_cast<const uint8_t*>(buf + data_start * 4);
         ctx.in_size = ndata * 4;
         if (g_trace) log("ipc: tipc %s cmd %u", sess->svc->name.c_str(), ctx.cmd);
+        if (sess->svc->name == "aoc:u")
+            log("aoc:u cmd=%u (TIPC)", ctx.cmd);
         uint32_t rc = sess->svc->handle(ctx);
         for (auto& o : ctx.out_objects) ctx.out_move.push_back(new_session_handle(o));
         std::memset(w, 0, 0x100);
@@ -240,6 +242,8 @@ uint32_t ipc_request(CPU& c, uint32_t handle, uint64_t buf, uint64_t) {
                 ctx.in_services.push_back(k ? k->svc : nullptr);
             }
         }
+        if (target->name == "aoc:u")
+            log("aoc:u cmd=%u (CMIF)", ctx.cmd);
         rc = target->handle(ctx);
     }
 

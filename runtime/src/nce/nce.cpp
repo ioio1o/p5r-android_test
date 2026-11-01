@@ -10,7 +10,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <string>
 
 #include "platform.h"
 
@@ -475,6 +477,62 @@ constexpr uint32_t kMaxHooks = 4096;
 HleFn g_hooks[kMaxHooks];
 std::atomic<uint32_t> g_hook_count{0};
 
+struct HookCounter {
+    alignas(8) uint64_t hits = 0;
+    std::string label;
+    uint64_t reported = 0;
+    std::atomic<bool> active{false};
+};
+
+std::mutex g_hook_stats_lock;
+std::vector<std::unique_ptr<HookCounter>> g_hook_stats;
+std::atomic<HookCounter*> g_inline_hook_stats[kMaxHooks]{};
+std::once_flag g_hook_stats_thread_once;
+
+void hook_stats_thread(void*) {
+    plat::set_thread_name("nce-hook-stats");
+    for (;;) {
+        plat::sleep_ns(10'000'000'000LL);
+        std::lock_guard lk(g_hook_stats_lock);
+        for (const auto& item : g_hook_stats) {
+            HookCounter& stat = *item;
+            if (!stat.active.load(std::memory_order_acquire))
+                continue;
+            const uint64_t hits = __atomic_load_n(&stat.hits, __ATOMIC_RELAXED);
+            if (hits == stat.reported)
+                continue;
+            log("hook %s hits=%llu", stat.label.c_str(),
+                (unsigned long long)hits);
+            stat.reported = hits;
+        }
+    }
+}
+
+HookCounter* make_hook_counter(uint64_t addr) {
+    auto item = std::make_unique<HookCounter>();
+    item->label = describe(addr);
+    HookCounter* result = item.get();
+    {
+        std::lock_guard lk(g_hook_stats_lock);
+        g_hook_stats.push_back(std::move(item));
+    }
+    std::call_once(g_hook_stats_thread_once, [] {
+        plat::start_thread(hook_stats_thread, nullptr, 1024 * 1024);
+    });
+    return result;
+}
+
+void activate_hook_counter(HookCounter* stat) {
+    if (stat)
+        stat->active.store(true, std::memory_order_release);
+}
+
+void register_inline_hook_counter(uint32_t index, uint64_t addr) {
+    HookCounter* stat = make_hook_counter(addr);
+    g_inline_hook_stats[index].store(stat, std::memory_order_release);
+    activate_hook_counter(stat);
+}
+
 // The counter: guest ticks = (CNTVCT * mul) >> 32, minus an offset that lines them up with plat::monotonic_ns().
 uint64_t g_tick_mul = uint64_t(1) << 32, g_tick_off = 0;
 
@@ -785,6 +843,7 @@ uint64_t hook(uint64_t addr, HleFn fn) {
 
     const uint32_t branch = b_to(addr, stub);
     write_code(addr, &branch, 4);
+    register_inline_hook_counter(index, addr);
     return original;
 }
 
@@ -824,14 +883,12 @@ uint64_t hook_guest(uint64_t addr, uint64_t replacement) {
     Region& r = it->second;
     const uint64_t start = r.cur;
 
-    if (start > UINT64_MAX - 32 || start > r.end)
+    if (start > UINT64_MAX - 64 || start > r.end)
         return 0;
-
     const uint64_t veneer = (start + 8 + 7) & ~uint64_t(7);
-    if (veneer > UINT64_MAX - 16)
+    if (veneer > UINT64_MAX - 40)
         return 0;
-
-    const uint64_t end = veneer + 16;
+    const uint64_t end = veneer + 40;
     if (end > r.end || end < start)
         return 0;
 
@@ -843,7 +900,6 @@ uint64_t hook_guest(uint64_t addr, uint64_t replacement) {
             return to - from < (uint64_t(1) << 27);
         return from - to <= (uint64_t(1) << 27);
     };
-
     if (!branch_fits(addr, veneer) ||
         !branch_fits(start + 4, addr + 4)) {
         log("nce: guest hook at %llx: branch out of range",
@@ -851,25 +907,30 @@ uint64_t hook_guest(uint64_t addr, uint64_t replacement) {
         return 0;
     }
 
+    HookCounter* counter = make_hook_counter(addr);
     const size_t word_count = static_cast<size_t>((end - start) / 4);
-    if (!word_count || word_count > 7)
+    if (!word_count)
         return 0;
-
-    uint32_t code[7];
-    for (size_t i = 0; i < word_count; ++i)
-        code[i] = kNop;
+    std::vector<uint32_t> code(word_count, kNop);
 
     // Trampoline: execute the displaced instruction, then resume at target+4.
     code[0] = first;
     code[1] = b_to(start + 4, addr + 4);
 
-    // Nearby veneer: load the absolute replacement address and branch to it.
-    const size_t veneer_index =
-        static_cast<size_t>((veneer - start) / 4);
-    code[veneer_index] = 0x58000050u;     // ldr x16, [pc, #8]
-    code[veneer_index + 1] = 0xD61F0200u; // br x16
-    code[veneer_index + 2] = static_cast<uint32_t>(replacement);
-    code[veneer_index + 3] = static_cast<uint32_t>(replacement >> 32);
+    // Count this function hook before branching to its replacement.
+    const size_t veneer_index = static_cast<size_t>((veneer - start) / 4);
+    code[veneer_index + 0] = 0x580000D0u; // ldr x16, counter literal (+24)
+    code[veneer_index + 1] = 0xF9400211u; // ldr x17, [x16]
+    code[veneer_index + 2] = 0x91000631u; // add x17, x17, #1 (no flags)
+    code[veneer_index + 3] = 0xF9000211u; // str x17, [x16]
+    code[veneer_index + 4] = 0x58000090u; // ldr x16, replacement literal (+16)
+    code[veneer_index + 5] = 0xD61F0200u; // br x16
+    const uint64_t counter_address =
+        reinterpret_cast<uintptr_t>(&counter->hits);
+    code[veneer_index + 6] = static_cast<uint32_t>(counter_address);
+    code[veneer_index + 7] = static_cast<uint32_t>(counter_address >> 32);
+    code[veneer_index + 8] = static_cast<uint32_t>(replacement);
+    code[veneer_index + 9] = static_cast<uint32_t>(replacement >> 32);
 
     const uint32_t target_branch = b_to(addr, veneer);
 
@@ -939,6 +1000,7 @@ uint64_t hook_guest(uint64_t addr, uint64_t replacement) {
     }
 
     r.cur = end;
+    activate_hook_counter(counter);
 
     log("nce: guest hook installed at %llx -> %llx; trampoline=%llx veneer=%llx",
         (unsigned long long)addr,
@@ -1053,6 +1115,7 @@ if (!protect(r.base, kRegionSize, PROT_READ | PROT_WRITE | PROT_EXEC))
 
     const uint32_t branch = b_to(addr, stub);
     write_code(addr, &branch, 4);
+    register_inline_hook_counter(index, addr);
 
     log("nce: inline BL hook at %llx -> stub %llx, relocated BL %llx -> %llx, return %llx",
         (unsigned long long)addr,
@@ -1184,6 +1247,7 @@ uint64_t hook_inline_instruction(uint64_t addr, HleFn fn) {
             (unsigned long long)addr);
         return 0;
     }
+    register_inline_hook_counter(index, addr);
 
     g_hooks[index] = fn;
     g_hook_count.store(index + 1);
@@ -1222,7 +1286,12 @@ extern "C" void nce_dispatch(uint64_t tp, uint32_t code) {
         const SvcSite& s = g_svc_sites[code & 0xFFFF];
         svc(c, s.imm, s.pc);
     } else if (code & 0x40000000u) {
-        g_hooks[code & 0xFFFF](c);
+        const uint32_t index = code & 0xFFFF;
+        HookCounter* stat =
+            g_inline_hook_stats[index].load(std::memory_order_acquire);
+        if (stat)
+            __atomic_add_fetch(&stat->hits, uint64_t(1), __ATOMIC_RELAXED);
+        g_hooks[index](c);
     } else {
         hle_invoke(c, code);
     }

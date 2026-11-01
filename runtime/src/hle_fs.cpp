@@ -4,6 +4,8 @@
 //   cache: -> private/user/cache<index>
 #include <cctype>
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -43,6 +45,132 @@ bool sd_fs_log_due() {
     static uint64_t total = 0;
     ++total;
     return total <= 20 || total % 10000 == 0;
+}
+
+struct SdPathStats {
+    std::atomic<uint64_t> opens{0};
+    std::atomic<uint64_t> size_queries{0};
+    std::atomic<uint64_t> reads{0};
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<uint64_t> max_offset{0};
+
+    uint64_t last_opens = 0;
+    uint64_t last_size_queries = 0;
+    uint64_t last_reads = 0;
+    uint64_t last_bytes = 0;
+    uint64_t last_max_offset = 0;
+    bool reported = false;
+};
+
+struct SdStatsRegistry {
+    std::mutex lock;
+    std::mutex report_lock;
+    std::map<std::string, std::shared_ptr<SdPathStats>> paths;
+};
+
+SdStatsRegistry& sd_stats_registry() {
+    static auto* registry = new SdStatsRegistry;
+    return *registry;
+}
+
+void report_sd_stats(bool final_report);
+
+void sd_stats_thread(void*) {
+    plat::set_thread_name("p5r-sd-stats");
+    for (;;) {
+        plat::sleep_ns(10'000'000'000LL);
+        report_sd_stats(false);
+    }
+}
+
+void start_sd_stats() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::atexit([] { report_sd_stats(true); });
+        plat::start_thread(sd_stats_thread, nullptr, 1024 * 1024);
+    });
+}
+
+std::shared_ptr<SdPathStats> sd_stats_for(const std::string& path) {
+    if (path.rfind("sd:", 0) != 0) return {};
+    start_sd_stats();
+
+    auto& registry = sd_stats_registry();
+    std::lock_guard lk(registry.lock);
+    auto& stats = registry.paths[path];
+    if (!stats) stats = std::make_shared<SdPathStats>();
+    return stats;
+}
+
+void record_sd_open(const std::string& path) {
+    if (auto stats = sd_stats_for(path))
+        stats->opens.fetch_add(1, std::memory_order_relaxed);
+}
+
+void record_sd_size_query(const std::string& path) {
+    if (auto stats = sd_stats_for(path))
+        stats->size_queries.fetch_add(1, std::memory_order_relaxed);
+}
+
+void record_sd_read(const std::string& path, int64_t offset, uint64_t bytes) {
+    auto stats = sd_stats_for(path);
+    if (!stats) return;
+
+    stats->reads.fetch_add(1, std::memory_order_relaxed);
+    stats->bytes.fetch_add(bytes, std::memory_order_relaxed);
+
+    if (offset >= 0) {
+        uint64_t value = uint64_t(offset);
+        uint64_t old = stats->max_offset.load(std::memory_order_relaxed);
+        while (old < value &&
+               !stats->max_offset.compare_exchange_weak(
+                   old, value, std::memory_order_relaxed)) {}
+    }
+}
+
+void report_sd_stats(bool final_report) {
+    auto& registry = sd_stats_registry();
+    std::lock_guard report_lk(registry.report_lock);
+
+    std::vector<std::pair<std::string, std::shared_ptr<SdPathStats>>> paths;
+    {
+        std::lock_guard lk(registry.lock);
+        for (const auto& item : registry.paths)
+            paths.push_back(item);
+    }
+
+    for (const auto& [path, stats] : paths) {
+        const uint64_t opens = stats->opens.load(std::memory_order_relaxed);
+        const uint64_t sizes = stats->size_queries.load(std::memory_order_relaxed);
+        const uint64_t reads = stats->reads.load(std::memory_order_relaxed);
+        const uint64_t bytes = stats->bytes.load(std::memory_order_relaxed);
+        const uint64_t max_offset = stats->max_offset.load(std::memory_order_relaxed);
+
+        const bool changed =
+            !stats->reported ||
+            opens != stats->last_opens ||
+            sizes != stats->last_size_queries ||
+            reads != stats->last_reads ||
+            bytes != stats->last_bytes ||
+            max_offset != stats->last_max_offset;
+
+        if (!changed && !final_report) continue;
+
+        log("fs: sd stats path=%s opens=%llu size_queries=%llu reads=%llu bytes=%llu max_offset=%llu",
+            path.c_str(),
+            (unsigned long long)opens,
+            (unsigned long long)sizes,
+            (unsigned long long)reads,
+            (unsigned long long)bytes,
+            (unsigned long long)max_offset);
+
+        stats->last_opens = opens;
+        stats->last_size_queries = sizes;
+        stats->last_reads = reads;
+        stats->last_bytes = bytes;
+        stats->last_max_offset = max_offset;
+        stats->reported = true;
+    }
 }
 
 struct SdFsCallTrace {
@@ -386,6 +514,7 @@ void GetEntryType(CPU& c) {  // (DirectoryEntryType* out, path)
 void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4 append)
     std::lock_guard lk(g_fs);
     std::string guest = cstr(c.x[1]);
+    record_sd_open(guest);
     SdFsCallTrace trace{"OpenFile", guest, c};
     fs::path p = resolve(guest);
     int mode = int(c.x[2]);
@@ -475,6 +604,7 @@ void GetFileSize(CPU& c) {  // (s64* out, FileHandle)
         c.x[0] = kTargetNotFound;
         return;
     }
+    record_sd_size_query(file->path);
     if (file->entry) {
         st<int64_t>(c.x[0], int64_t(file->entry->size));
         c.x[0] = kOk;
@@ -519,6 +649,7 @@ void ReadFileOut(CPU& c) {  // (size_t* out, FileHandle, s64 off, void* buf, siz
     SdFsCallTrace trace{"ReadFile", file->path, c};
     const uint64_t out = c.x[0];
     trace.count = read_at(*file, int64_t(c.x[2]), c.x[3], c.x[4]);
+    record_sd_read(file->path, int64_t(c.x[2]), trace.count);
     st<uint64_t>(out, trace.count);
     c.x[0] = kOk;
 }
@@ -531,6 +662,7 @@ void ReadFile(CPU& c) {  // (FileHandle, s64 off, void* buf, size_t size)
     }
     SdFsCallTrace trace{"ReadFile", file->path, c};
     trace.count = read_at(*file, int64_t(c.x[1]), c.x[2], c.x[3]);
+    record_sd_read(file->path, int64_t(c.x[1]), trace.count);
     c.x[0] = kOk;
 }
 
