@@ -47,6 +47,9 @@ bool write_code_checked(uint64_t addr, const void* src, size_t size,
 uint64_t hook(uint64_t addr, HleFn fn);
 // Replaces a guest function with an already-validated guest address.
 uint64_t hook_guest(uint64_t addr, uint64_t replacement);
+// Creates a counting veneer for an executable pointer stored in module data.
+uint64_t counting_veneer(uint64_t module_base, uint64_t slot,
+                         uint64_t target, const char* label);
 // Installs an inline hook for a single displaced AArch64 BL instruction.
 uint64_t hook_inline(uint64_t addr, HleFn fn);
 uint64_t hook_inline_instruction(uint64_t addr, HleFn fn);

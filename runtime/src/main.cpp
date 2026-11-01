@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -270,6 +271,7 @@ struct SkylinePluginRuntime {
 
     size_t reloc_relative = 0, reloc_glob_dat = 0;
     size_t reloc_jump_slot = 0, reloc_abs64 = 0;
+    std::vector<std::string> option_diff;
 };
 
 static std::vector<std::unique_ptr<SkylinePluginRuntime>> g_skyline_plugins;
@@ -297,27 +299,62 @@ static bool skyline_plugin_text_address(uint64_t address) {
     return false;
 }
 
-static std::string skyline_plugin_address_label(
+static SkylinePluginRuntime* skyline_plugin_from_address(
     uint64_t address, bool return_address = false) {
     if (return_address && address >= 4)
-        address -= 4; // HLE caller LR points immediately after the BL.
+        address -= 4;
 
     for (const auto& owned : g_skyline_plugins) {
         if (!owned)
             continue;
 
-        const SkylinePluginRuntime& plugin = *owned;
+        SkylinePluginRuntime& plugin = *owned;
         const uint64_t begin = plugin.base + plugin.info.text;
         if (plugin.info.text_size && address >= begin &&
-            address - begin < plugin.info.text_size) {
-            char offset[32]{};
-            std::snprintf(offset, sizeof(offset), "+0x%llx",
-                (unsigned long long)(address - plugin.base));
-            return plugin.name + offset;
-        }
+            address - begin < plugin.info.text_size)
+            return &plugin;
     }
 
-    return "non-plugin";
+    return nullptr;
+}
+
+static std::string skyline_plugin_address_label(
+    uint64_t address, bool return_address = false) {
+    SkylinePluginRuntime* plugin =
+        skyline_plugin_from_address(address, return_address);
+    if (!plugin)
+        return "non-plugin";
+
+    uint64_t adjusted = address;
+    if (return_address && adjusted >= 4)
+        adjusted -= 4;
+
+    char offset[32]{};
+    std::snprintf(offset, sizeof(offset), "+0x%llx",
+        (unsigned long long)(adjusted - plugin->base));
+    return plugin->name + offset;
+}
+
+static void skyline_record_option(
+    uint64_t caller, bool return_address, const std::string& entry) {
+    SkylinePluginRuntime* plugin =
+        skyline_plugin_from_address(caller, return_address);
+    if (plugin)
+        plugin->option_diff.push_back(entry);
+}
+
+static void skyline_report_option_diff(
+    const SkylinePluginRuntime& plugin) {
+    log("skyline: option-diff begin plugin=%s entries=%zu",
+        plugin.name.c_str(), plugin.option_diff.size());
+
+    for (size_t i = 0; i < plugin.option_diff.size(); ++i)
+        log("skyline: option-diff plugin=%s [%zu] %s",
+            plugin.name.c_str(), i + 1,
+            plugin.option_diff[i].c_str());
+
+    log("skyline: option-diff end plugin=%s",
+        plugin.name.c_str());
 }
 
 static bool skyline_plugin_allowed(const std::string& filename) {
@@ -422,6 +459,23 @@ static bool skyline_main_text_target(uint64_t target) {
     return target >= begin && target - begin < g_main->text_size;
 }
 
+static bool skyline_executable_address(uint64_t target) {
+    if (!target || (target & 3))
+        return false;
+
+    if (skyline_main_text_target(target) ||
+        skyline_plugin_text_address(target))
+        return true;
+
+    if (g_sdk && g_sdk->text_size) {
+        const uint64_t begin = g_sdk->base + g_sdk->text;
+        if (target >= begin && target - begin < g_sdk->text_size)
+            return true;
+    }
+
+    return false;
+}
+
 static const char* skyline_pc_relative_kind(uint32_t insn) {
     if ((insn & 0x1F000000u) == 0x10000000u) return "ADR/ADRP";
     if ((insn & 0x7C000000u) == 0x14000000u) return "B/BL";
@@ -488,6 +542,118 @@ static void skyline_get_region(CPU& c) {
 
 
 static uint64_t g_skyline_memcpy_log_count = 0;
+
+struct SkylinePatchWatch {
+    uint64_t address = 0;
+    std::string label;
+    std::vector<uint8_t> expected;
+};
+
+static std::mutex g_skyline_patch_watch_lock;
+static std::vector<SkylinePatchWatch> g_skyline_patch_watches;
+static bool g_skyline_patch_watcher_started = false;
+
+static std::string skyline_patch_value(
+    const std::vector<uint8_t>& bytes) {
+    char value[32]{};
+
+    if (bytes.size() == sizeof(uint64_t)) {
+        uint64_t pointer = 0;
+        std::memcpy(&pointer, bytes.data(), sizeof(pointer));
+        std::snprintf(value, sizeof(value), "0x%016llx",
+            (unsigned long long)pointer);
+        return value;
+    }
+
+    std::string result = "[";
+    const size_t count = std::min<size_t>(bytes.size(), 16);
+    char byte[4]{};
+
+    for (size_t i = 0; i < count; ++i) {
+        std::snprintf(byte, sizeof(byte), "%02x%s",
+            bytes[i], i + 1 < count ? " " : "");
+        result += byte;
+    }
+
+    if (bytes.size() > count)
+        result += " ...";
+
+    result += "]";
+    return result;
+}
+
+static void skyline_patch_watcher(void*) {
+    plat::set_thread_name("skyline-patch-watch");
+
+    for (;;) {
+        plat::sleep_ns(10'000'000'000LL);
+
+        std::lock_guard lock(g_skyline_patch_watch_lock);
+
+        for (auto& patch : g_skyline_patch_watches) {
+            if (!guest_range_ok(
+                    patch.address, patch.expected.size(), 1))
+                continue;
+
+            std::vector<uint8_t> current(patch.expected.size());
+            std::memcpy(current.data(),
+                reinterpret_cast<const void*>(patch.address),
+                current.size());
+
+            if (current == patch.expected)
+                continue;
+
+            log("skyline: patch %s changed from %s to %s",
+                patch.label.c_str(),
+                skyline_patch_value(patch.expected).c_str(),
+                skyline_patch_value(current).c_str());
+
+            // Compare the next interval against the newly observed value.
+            patch.expected = std::move(current);
+        }
+    }
+}
+
+static void skyline_watch_patch(
+    uint64_t address, const std::string& label,
+    const uint8_t* bytes, size_t size) {
+    if (!address || !bytes || !size)
+        return;
+
+    bool start_watcher = false;
+
+    {
+        std::lock_guard lock(g_skyline_patch_watch_lock);
+
+        auto found = std::find_if(
+            g_skyline_patch_watches.begin(),
+            g_skyline_patch_watches.end(),
+            [address, size](const SkylinePatchWatch& patch) {
+                return patch.address == address &&
+                       patch.expected.size() == size;
+            });
+
+        if (found == g_skyline_patch_watches.end()) {
+            SkylinePatchWatch patch;
+            patch.address = address;
+            patch.label = label;
+            patch.expected.assign(bytes, bytes + size);
+            g_skyline_patch_watches.push_back(std::move(patch));
+        } else {
+            found->label = label;
+            found->expected.assign(bytes, bytes + size);
+        }
+
+        if (!g_skyline_patch_watcher_started) {
+            g_skyline_patch_watcher_started = true;
+            start_watcher = true;
+        }
+    }
+
+    if (start_watcher)
+        plat::start_thread(
+            skyline_patch_watcher, nullptr, 1024 * 1024);
+}
 
 static void skyline_memcpy(CPU& c) {
     const uint64_t dst = c.x[0];
@@ -642,6 +808,14 @@ static void skyline_memcpy(CPU& c) {
         return;
     }
 
+    uint64_t requested_pointer = 0;
+    const bool pointer_write =
+        is_data && size == sizeof(uint64_t) && (dst & 7) == 0;
+
+    if (pointer_write)
+        std::memcpy(&requested_pointer,
+            reinterpret_cast<const void*>(src), sizeof(requested_pointer));
+
     bool used_rwx = false;
     bool success = false;
 
@@ -660,8 +834,70 @@ static void skyline_memcpy(CPU& c) {
         return;
     }
 
+    bool pointer_veneer_installed = false;
+    uint64_t pointer_veneer = 0;
+
+    if (pointer_write && skyline_executable_address(requested_pointer)) {
+        char pointer_label[160]{};
+        std::snprintf(pointer_label, sizeof(pointer_label), "%s+0x%llx",
+            owner_name.c_str(),
+            (unsigned long long)segment_offset);
+
+        const uint64_t module_base =
+            owner ? owner->base : (main_owner ? g_main->base : 0);
+
+        pointer_veneer = nce::counting_veneer(
+            module_base, dst, requested_pointer, pointer_label);
+
+        if (pointer_veneer) {
+            std::memcpy(reinterpret_cast<void*>(dst),
+                &pointer_veneer, sizeof(pointer_veneer));
+            pointer_veneer_installed = true;
+        } else {
+            log("skyline: pointer counter unavailable for %s; original pointer retained",
+                pointer_label);
+        }
+    }
+
     std::memcpy(after, reinterpret_cast<const void*>(dst), preview_size);
     c.x[0] = 0;
+
+    char patch_label[160]{};
+    std::snprintf(patch_label, sizeof(patch_label), "%s+0x%llx",
+        owner_name.c_str(), (unsigned long long)segment_offset);
+
+    std::vector<uint8_t> written(size);
+    std::memcpy(written.data(),
+        reinterpret_cast<const void*>(dst), size);
+
+    // Watch the value actually left in the slot (the veneer, if installed).
+    skyline_watch_patch(
+        dst, patch_label, written.data(), written.size());
+
+    uint64_t hash = 1469598103934665603ull;
+    for (uint8_t byte : written) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+
+    char option[512]{};
+
+    if (pointer_write) {
+        std::snprintf(option, sizeof(option),
+            "sky_memcpy %s size=%zu value=0x%016llx stored=0x%016llx hash=%016llx",
+            patch_label, size,
+            (unsigned long long)requested_pointer,
+            (unsigned long long)(pointer_veneer_installed
+                ? pointer_veneer : requested_pointer),
+            (unsigned long long)hash);
+    } else {
+        std::snprintf(option, sizeof(option),
+            "sky_memcpy %s size=%zu bytes=%s hash=%016llx",
+            patch_label, size, skyline_patch_value(written).c_str(),
+            (unsigned long long)hash);
+    }
+
+    skyline_record_option(caller, true, option);
 
     if (emit) {
         char before_hex[16 * 3 + 1]{};
@@ -765,6 +1001,10 @@ static void skyline_a64_hook_function(CPU& c) {
     const uint64_t result_slot = c.x[2];
     const uint64_t caller = c.x[30];
     const std::string caller_owner = skyline_plugin_address_label(caller, true);
+
+    skyline_record_option(caller, true,
+        "A64HookFunction target=" + describe(target) +
+        " replacement=" + skyline_plugin_address_label(replacement));
 
     skyline_log_hook_target("A64HookFunction", target);
     log("skyline: hook-register api=A64HookFunction owner=%s caller=%llx "
@@ -1055,6 +1295,10 @@ static void skyline_a64_inline_hook(CPU& c) {
     const uint64_t replacement = c.x[1];
     const uint64_t caller = c.x[30];
     const std::string caller_owner = skyline_plugin_address_label(caller, true);
+
+    skyline_record_option(caller, true,
+        "A64InlineHook target=" + describe(target) +
+        " replacement=" + skyline_plugin_address_label(replacement));
 
     skyline_log_hook_target("A64InlineHook", target);
     log("skyline: hook-register api=A64InlineHook owner=%s caller=%llx "
@@ -1844,6 +2088,7 @@ static void run_skyline_plugins(CPU& c) {
         if (!entry || !skyline_plugin_function(plugin, entry)) {
             log("skyline: %s has no valid main entry; execution stopped",
                 plugin.name.c_str());
+            skyline_report_option_diff(plugin);
             continue;
         }
 
@@ -1866,6 +2111,8 @@ static void run_skyline_plugins(CPU& c) {
 
         log("skyline: %s plugin main returned",
             plugin.name.c_str());
+
+        skyline_report_option_diff(plugin);
 
         log("skyline: %s post-main hooks: function_requests=%llu "
             "inline_requests=%llu inline_installed=%llu "

@@ -464,6 +464,7 @@ struct Region {
 };
 
 std::map<uint64_t, Region> g_regions;  // by module base
+std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_pointer_veneers;
 std::mutex g_regions_lock;
 uint64_t g_return = 0;  // nce_return (the thunk region's copy)
 
@@ -522,9 +523,9 @@ void hook_stats_thread(void*) {
     }
 }
 
-HookCounter* make_hook_counter(uint64_t addr, const char* kind) {
+HookCounter* make_hook_counter(const std::string& label, const char* kind) {
     auto item = std::make_unique<HookCounter>();
-    item->label = describe(addr);
+    item->label = label;
     item->kind = kind;
     HookCounter* result = item.get();
     {
@@ -535,6 +536,10 @@ HookCounter* make_hook_counter(uint64_t addr, const char* kind) {
         plat::start_thread(hook_stats_thread, nullptr, 1024 * 1024);
     });
     return result;
+}
+
+HookCounter* make_hook_counter(uint64_t addr, const char* kind) {
+    return make_hook_counter(describe(addr), kind);
 }
 
 void activate_hook_counter(HookCounter* stat) {
@@ -1024,6 +1029,105 @@ uint64_t hook_guest(uint64_t addr, uint64_t replacement) {
         (unsigned long long)veneer);
 
     return start;
+}
+
+// A data-slot pointer veneer. It preserves the original function's ABI:
+// only caller-saved x16/x17 are used, and NZCV is not modified.
+uint64_t counting_veneer(uint64_t module_base, uint64_t slot,
+                         uint64_t target, const char* label) {
+    std::lock_guard lk(g_regions_lock);
+
+    auto region_it = g_regions.find(module_base);
+    if (!module_base || !slot || !target ||
+        region_it == g_regions.end()) {
+        log("nce: pointer veneer at %llx: module region or target unavailable",
+            (unsigned long long)slot);
+        return 0;
+    }
+
+    auto existing = g_pointer_veneers.find(slot);
+    if (existing != g_pointer_veneers.end() &&
+        existing->second.first == target)
+        return existing->second.second;
+
+    Region& r = region_it->second;
+    const uint64_t start = r.cur;
+    const uint64_t veneer = (start + 7) & ~uint64_t(7);
+
+    if (r.failed || veneer < start || veneer > r.end ||
+        r.end - veneer < 40) {
+        log("nce: pointer veneer at %llx: stub region exhausted",
+            (unsigned long long)slot);
+        return 0;
+    }
+
+    HookCounter* counter = make_hook_counter(
+        label && *label ? label : describe(slot), "ptr");
+
+    const size_t word_count =
+        static_cast<size_t>((veneer - start) / 4) + 10;
+    std::vector<uint32_t> code(word_count, kNop);
+    const size_t index =
+        static_cast<size_t>((veneer - start) / 4);
+
+    // ldr x16, counter_literal
+    // ldr x17, [x16]
+    // add x17, x17, #1
+    // str x17, [x16]
+    // ldr x16, target_literal
+    // br x16
+    code[index + 0] = 0x580000D0u;
+    code[index + 1] = 0xF9400211u;
+    code[index + 2] = 0x91000631u;
+    code[index + 3] = 0xF9000211u;
+    code[index + 4] = 0x58000090u;
+    code[index + 5] = 0xD61F0200u;
+
+    const uint64_t counter_address =
+        reinterpret_cast<uintptr_t>(&counter->hits);
+
+    code[index + 6] = static_cast<uint32_t>(counter_address);
+    code[index + 7] = static_cast<uint32_t>(counter_address >> 32);
+    code[index + 8] = static_cast<uint32_t>(target);
+    code[index + 9] = static_cast<uint32_t>(target >> 32);
+
+    bool region_writable =
+        protect(r.base, kRegionSize,
+                PROT_READ | PROT_WRITE | PROT_EXEC);
+    if (!region_writable)
+        region_writable =
+            protect(r.base, kRegionSize, PROT_READ | PROT_WRITE);
+
+    if (!region_writable) {
+        log("nce: pointer veneer at %llx: stub region is not writable",
+            (unsigned long long)slot);
+        return 0;
+    }
+
+    const size_t code_size = code.size() * sizeof(uint32_t);
+    std::memcpy(reinterpret_cast<void*>(start),
+                code.data(), code_size);
+
+    if (!protect(r.base, kRegionSize, PROT_READ | PROT_EXEC)) {
+        log("nce: pointer veneer at %llx: could not restore stub RX permissions",
+            (unsigned long long)slot);
+        return 0;
+    }
+
+    clear_cache(start, code_size);
+    r.cur = veneer + 40;
+
+    activate_hook_counter(counter);
+    g_pointer_veneers[slot] = {target, veneer};
+
+    log("hook %s kind=ptr hits=0",
+        label && *label ? label : describe(slot).c_str());
+    log("nce: pointer veneer installed slot=%s target=%llx veneer=%llx",
+        label && *label ? label : describe(slot).c_str(),
+        (unsigned long long)target,
+        (unsigned long long)veneer);
+
+    return veneer;
 }
 
 uint64_t hook_inline(uint64_t addr, HleFn fn) {
