@@ -964,7 +964,7 @@ uint64_t hook_guest(uint64_t addr, uint64_t replacement) {
 
     std::memcpy(
         reinterpret_cast<void*>(start),
-        code,
+        code.data(),
         word_count * sizeof(uint32_t)
     );
     clear_cache(start, word_count * sizeof(uint32_t));
