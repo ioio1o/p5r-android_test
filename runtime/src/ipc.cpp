@@ -92,6 +92,30 @@ uint32_t ipc_request(CPU& c, uint32_t handle, uint64_t buf, uint64_t) {
     }
     uint32_t* w = reinterpret_cast<uint32_t*>(buf);
     IpcCtx ctx;
+    std::vector<Buffer> wbufs;
+    auto log_aoc = [&ctx, &wbufs](const char* protocol, uint32_t rc) {
+        auto total_size = [](const std::vector<Buffer>& buffers) {
+            uint64_t total = 0;
+            for (const auto& buffer : buffers)
+                total += buffer.size;
+            return total;
+        };
+        log("aoc:u cmd=%u protocol=%s in=%zu "
+            "buffers[A=%zu/%llu B=%zu/%llu W=%zu/%llu X=%zu/%llu C=%zu/%llu] "
+            "handles[in_copy=%zu in_move=%zu in_objects=%zu in_services=%zu "
+            "out_copy=%zu out_move=%zu out_objects=%zu] "
+            "out=%zu result=0x%08x",
+            ctx.cmd, protocol, ctx.in_size,
+            ctx.a.size(), (unsigned long long)total_size(ctx.a),
+            ctx.b.size(), (unsigned long long)total_size(ctx.b),
+            wbufs.size(), (unsigned long long)total_size(wbufs),
+            ctx.x.size(), (unsigned long long)total_size(ctx.x),
+            ctx.c.size(), (unsigned long long)total_size(ctx.c),
+            ctx.in_copy.size(), ctx.in_move.size(),
+            ctx.in_objects.size(), ctx.in_services.size(),
+            ctx.out_copy.size(), ctx.out_move.size(),
+            ctx.out_objects.size(), ctx.out.size(), rc);
+    };
     ctx.cpu = &c;
     ctx.type = w[0] & 0xFFFF;
     uint32_t nx_ = (w[0] >> 16) & 0xF, na = (w[0] >> 20) & 0xF, nb = (w[0] >> 24) & 0xF, nw = (w[0] >> 28) & 0xF;
@@ -125,7 +149,6 @@ uint32_t ipc_request(CPU& c, uint32_t handle, uint64_t buf, uint64_t) {
     };
     abw(ctx.a, na);
     abw(ctx.b, nb);
-    std::vector<Buffer> wbufs;
     abw(wbufs, nw);
     size_t data_start = p;
     // C descriptors (receive list) after the raw data.
@@ -149,9 +172,9 @@ uint32_t ipc_request(CPU& c, uint32_t handle, uint64_t buf, uint64_t) {
         ctx.in = reinterpret_cast<const uint8_t*>(buf + data_start * 4);
         ctx.in_size = ndata * 4;
         if (g_trace) log("ipc: tipc %s cmd %u", sess->svc->name.c_str(), ctx.cmd);
-        if (sess->svc->name == "aoc:u")
-            log("aoc:u cmd=%u (TIPC)", ctx.cmd);
         uint32_t rc = sess->svc->handle(ctx);
+        if (sess->svc->name == "aoc:u")
+            log_aoc("TIPC", rc);
         for (auto& o : ctx.out_objects) ctx.out_move.push_back(new_session_handle(o));
         std::memset(w, 0, 0x100);
         bool has_special = !ctx.out_copy.empty() || !ctx.out_move.empty();
@@ -242,9 +265,9 @@ uint32_t ipc_request(CPU& c, uint32_t handle, uint64_t buf, uint64_t) {
                 ctx.in_services.push_back(k ? k->svc : nullptr);
             }
         }
-        if (target->name == "aoc:u")
-            log("aoc:u cmd=%u (CMIF)", ctx.cmd);
         rc = target->handle(ctx);
+        if (target->name == "aoc:u")
+            log_aoc("CMIF", rc);
     }
 
     {

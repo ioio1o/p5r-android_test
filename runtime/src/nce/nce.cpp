@@ -480,6 +480,7 @@ std::atomic<uint32_t> g_hook_count{0};
 struct HookCounter {
     alignas(8) uint64_t hits = 0;
     std::string label;
+    std::string kind;
     uint64_t reported = 0;
     std::atomic<bool> active{false};
 };
@@ -494,23 +495,37 @@ void hook_stats_thread(void*) {
     for (;;) {
         plat::sleep_ns(10'000'000'000LL);
         std::lock_guard lk(g_hook_stats_lock);
+
+        bool changed = false;
         for (const auto& item : g_hook_stats) {
             HookCounter& stat = *item;
             if (!stat.active.load(std::memory_order_acquire))
                 continue;
             const uint64_t hits = __atomic_load_n(&stat.hits, __ATOMIC_RELAXED);
-            if (hits == stat.reported)
+            if (hits != stat.reported)
+                changed = true;
+        }
+
+        if (!changed)
+            continue;
+
+        for (const auto& item : g_hook_stats) {
+            HookCounter& stat = *item;
+            if (!stat.active.load(std::memory_order_acquire))
                 continue;
-            log("hook %s hits=%llu", stat.label.c_str(),
+            const uint64_t hits = __atomic_load_n(&stat.hits, __ATOMIC_RELAXED);
+            log("hook %s kind=%s hits=%llu",
+                stat.label.c_str(), stat.kind.c_str(),
                 (unsigned long long)hits);
             stat.reported = hits;
         }
     }
 }
 
-HookCounter* make_hook_counter(uint64_t addr) {
+HookCounter* make_hook_counter(uint64_t addr, const char* kind) {
     auto item = std::make_unique<HookCounter>();
     item->label = describe(addr);
+    item->kind = kind;
     HookCounter* result = item.get();
     {
         std::lock_guard lk(g_hook_stats_lock);
@@ -527,8 +542,8 @@ void activate_hook_counter(HookCounter* stat) {
         stat->active.store(true, std::memory_order_release);
 }
 
-void register_inline_hook_counter(uint32_t index, uint64_t addr) {
-    HookCounter* stat = make_hook_counter(addr);
+void register_inline_hook_counter(uint32_t index, uint64_t addr, const char* kind) {
+    HookCounter* stat = make_hook_counter(addr, kind);
     g_inline_hook_stats[index].store(stat, std::memory_order_release);
     activate_hook_counter(stat);
 }
@@ -843,7 +858,7 @@ uint64_t hook(uint64_t addr, HleFn fn) {
 
     const uint32_t branch = b_to(addr, stub);
     write_code(addr, &branch, 4);
-    register_inline_hook_counter(index, addr);
+    register_inline_hook_counter(index, addr, "inline");
     return original;
 }
 
@@ -907,7 +922,7 @@ uint64_t hook_guest(uint64_t addr, uint64_t replacement) {
         return 0;
     }
 
-    HookCounter* counter = make_hook_counter(addr);
+    HookCounter* counter = make_hook_counter(addr, "func");
     const size_t word_count = static_cast<size_t>((end - start) / 4);
     if (!word_count)
         return 0;
@@ -1115,7 +1130,7 @@ if (!protect(r.base, kRegionSize, PROT_READ | PROT_WRITE | PROT_EXEC))
 
     const uint32_t branch = b_to(addr, stub);
     write_code(addr, &branch, 4);
-    register_inline_hook_counter(index, addr);
+    register_inline_hook_counter(index, addr, "bl");
 
     log("nce: inline BL hook at %llx -> stub %llx, relocated BL %llx -> %llx, return %llx",
         (unsigned long long)addr,
@@ -1247,7 +1262,7 @@ uint64_t hook_inline_instruction(uint64_t addr, HleFn fn) {
             (unsigned long long)addr);
         return 0;
     }
-    register_inline_hook_counter(index, addr);
+    register_inline_hook_counter(index, addr, "inline");
 
     g_hooks[index] = fn;
     g_hook_count.store(index + 1);
