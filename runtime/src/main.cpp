@@ -297,6 +297,29 @@ static bool skyline_plugin_text_address(uint64_t address) {
     return false;
 }
 
+static std::string skyline_plugin_address_label(
+    uint64_t address, bool return_address = false) {
+    if (return_address && address >= 4)
+        address -= 4; // HLE caller LR points immediately after the BL.
+
+    for (const auto& owned : g_skyline_plugins) {
+        if (!owned)
+            continue;
+
+        const SkylinePluginRuntime& plugin = *owned;
+        const uint64_t begin = plugin.base + plugin.info.text;
+        if (plugin.info.text_size && address >= begin &&
+            address - begin < plugin.info.text_size) {
+            char offset[32]{};
+            std::snprintf(offset, sizeof(offset), "+0x%llx",
+                (unsigned long long)(address - plugin.base));
+            return plugin.name + offset;
+        }
+    }
+
+    return "non-plugin";
+}
+
 static bool skyline_plugin_allowed(const std::string& filename) {
     static bool loaded = false;
     static std::vector<std::string> allowed;
@@ -740,11 +763,18 @@ static void skyline_a64_hook_function(CPU& c) {
     const uint64_t target = c.x[0];
     const uint64_t replacement = c.x[1];
     const uint64_t result_slot = c.x[2];
+    const uint64_t caller = c.x[30];
+    const std::string caller_owner = skyline_plugin_address_label(caller, true);
 
     skyline_log_hook_target("A64HookFunction", target);
+    log("skyline: hook-register api=A64HookFunction owner=%s caller=%llx "
+        "target=%s replacement=%s",
+        caller_owner.c_str(), (unsigned long long)caller,
+        describe(target).c_str(),
+        skyline_plugin_address_label(replacement).c_str());
 
-    const bool emit =
-        skyline_hook_log_due(g_skyline_function_hook_log_count);
+    ++g_skyline_function_hook_log_count;
+    const bool emit = true;
     const uint64_t event = g_skyline_function_hook_log_count;
 
     if ((result_slot & 7) != 0 ||
@@ -1023,11 +1053,18 @@ static void skyline_a64_inline_hook(CPU& c) {
 
     const uint64_t target = c.x[0];
     const uint64_t replacement = c.x[1];
+    const uint64_t caller = c.x[30];
+    const std::string caller_owner = skyline_plugin_address_label(caller, true);
 
     skyline_log_hook_target("A64InlineHook", target);
+    log("skyline: hook-register api=A64InlineHook owner=%s caller=%llx "
+        "target=%s replacement=%s",
+        caller_owner.c_str(), (unsigned long long)caller,
+        describe(target).c_str(),
+        skyline_plugin_address_label(replacement).c_str());
 
-    const bool emit =
-        skyline_hook_log_due(g_skyline_inline_hook_log_count);
+    ++g_skyline_inline_hook_log_count;
+    const bool emit = true;
     const uint64_t event = g_skyline_inline_hook_log_count;
 
     if (g_skyline_hook_mode == SkylineHookMode::Off) {
