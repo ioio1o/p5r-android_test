@@ -2083,6 +2083,23 @@ static bool load_skyline_nro(const std::filesystem::path& path) {
 
         resolved_symbols[i] = target;
 
+        if (std::strstr(name, "Random") ||
+            std::strstr(name, "random") ||
+            std::strstr(name, "csrng") ||
+            std::strstr(name, "time")) {
+            const char* source_name =
+                source == kImportPlugin ? "plugin" :
+                source == kImportHle ? "HLE" :
+                source == kImportMain ? "main" :
+                source == kImportSdk ? "SDK" : "unresolved";
+
+            log("skyline: import-resolution plugin=%s symbol=%s "
+                "source=%s target=0x%016llx description=%s",
+                plugin->name.c_str(), name, source_name,
+                (unsigned long long)target,
+                describe(target).c_str());
+        }
+
         switch (source) {
         case kImportPlugin: ++imports_plugin; break;
         case kImportHle: ++imports_hle; break;
@@ -2498,6 +2515,105 @@ static void run_skyline_plugins(CPU& c) {
     }
 }
 
+static uint64_t g_random_bytes_original = 0;
+static uint64_t g_random_bytes_calls = 0;
+
+static void skyline_trace_generate_random_bytes(CPU& c) {
+    const uint64_t destination = c.x[0];
+    const uint64_t requested_size = c.x[1];
+    const uint64_t caller = c.x[30];
+
+    const uint64_t invocation =
+        __atomic_add_fetch(&g_random_bytes_calls, uint64_t(1),
+                           __ATOMIC_RELAXED);
+
+    const std::string caller_description = describe(caller);
+
+    // Execute the real SDK function through its NCE trampoline.
+    call(c, g_random_bytes_original);
+
+    if (invocation > 64) {
+        if (invocation == 65)
+            log("skyline: random-bytes further calls suppressed");
+        return;
+    }
+
+    uint8_t bytes[16]{};
+    const size_t count = static_cast<size_t>(
+        std::min<uint64_t>(requested_size, sizeof(bytes)));
+
+    // Inspect output only when the guest destination is readable.
+    const bool output_readable =
+        count == 0 || guest_range_ok(destination, count, 1);
+
+    if (count && output_readable) {
+        std::memcpy(bytes,
+                    reinterpret_cast<const void*>(destination),
+                    count);
+    }
+
+    char hex[16 * 3 + 1]{};
+    size_t used = 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        const int n = std::snprintf(
+            hex + used, sizeof(hex) - used,
+            "%s%02x", i ? " " : "", bytes[i]);
+
+        if (n <= 0)
+            break;
+
+        used += static_cast<size_t>(n);
+    }
+
+    log("skyline: random-bytes invocation=%llu "
+        "caller=0x%016llx (%s) destination=0x%016llx "
+        "size=%llu output_size=%zu output=[%s] "
+        "plugin_trace=%s plugin_target=0x%llx",
+        (unsigned long long)invocation,
+        (unsigned long long)caller,
+        caller_description.c_str(),
+        (unsigned long long)destination,
+        (unsigned long long)requested_size,
+        count, output_readable ? hex : "<unreadable>",
+        plugin_trace_active() ? plugin_trace_hook() : "none",
+        (unsigned long long)plugin_trace_target());
+}
+
+static void skyline_install_random_trace() {
+    if (g_random_bytes_original)
+        return;
+
+    static constexpr const char* kRandomSymbol =
+        "_ZN2nn2os19GenerateRandomBytesEPvm";
+
+    const uint64_t target = skyline_module_symbol(g_sdk, kRandomSymbol);
+
+    if (!target) {
+        log("skyline: random trace: SDK symbol %s not found",
+            kRandomSymbol);
+        return;
+    }
+
+    const uint64_t original =
+        hook_function(target, skyline_trace_generate_random_bytes);
+
+    if (!original) {
+        log("skyline: random trace: hook installation failed "
+            "target=0x%llx (%s)",
+            (unsigned long long)target, describe(target).c_str());
+        return;
+    }
+
+    g_random_bytes_original = original;
+
+    log("skyline: random trace installed target=0x%016llx "
+        "original=0x%016llx description=%s",
+        (unsigned long long)target,
+        (unsigned long long)original,
+        describe(target).c_str());
+}
+
 static void inspect_skyline_nro(const std::filesystem::path& path) {
     (void)load_skyline_nro(path);
 }
@@ -2509,6 +2625,10 @@ static void inspect_skyline_nro(const std::filesystem::path& path) {
 // before entering the real game nnMain.
 static void nn_main(CPU& c) {
 #if NX_NCE
+    // SDK text is already mapped and NCE-prepared. Install before either
+    // plugin phase, including before_ctors, and before SDK constructors.
+    skyline_install_random_trace();
+
     const bool plugins_before_ctors =
         skyline_plugin_phase_before_ctors();
     if (plugins_before_ctors)
@@ -2516,6 +2636,7 @@ static void nn_main(CPU& c) {
 #endif
 
     init_module(c, *g_sdk);
+
     init_module(c, *g_main);
     game::after_init();
 
