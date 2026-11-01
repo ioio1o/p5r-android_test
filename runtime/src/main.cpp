@@ -2208,7 +2208,7 @@ static bool load_skyline_nro(const std::filesystem::path& path) {
         }
     }
 
-    log("skyline: %s imports: plugin=%zu HLE=%zu main=%zu SDK=%zu "
+        log("skyline: %s imports: plugin=%zu HLE=%zu main=%zu SDK=%zu "
         "unresolved=%zu",
         plugin->name.c_str(), imports_plugin, imports_hle,
         imports_main, imports_sdk, imports_unresolved);
@@ -2367,6 +2367,64 @@ static void run_skyline_plugins(CPU& c) {
                         plugin.name.c_str(),
                         i);
                 }
+            }
+        }
+
+        // Read dispatch slots after DT_INIT and init_array constructors.
+        if (plugin.name == "libp5r_bdsm.nro") {
+            static constexpr uint64_t kDispatchSlots[] = {
+                0x51138, 0x511d0, 0x511d8
+            };
+
+            for (uint64_t offset : kDispatchSlots) {
+                if (offset > plugin.mapped_size ||
+                    sizeof(uint64_t) > plugin.mapped_size - offset) {
+                    log("skyline: dispatch-slot offset=0x%llx outside mapped image",
+                        (unsigned long long)offset);
+                    continue;
+                }
+
+                uint64_t value = 0;
+                std::memcpy(&value,
+                    reinterpret_cast<const void*>(plugin.base + offset),
+                    sizeof(value));
+
+                const Reloc* slot_reloc = nullptr;
+                for (const Reloc& r : plugin.relocs) {
+                    if (r.offset == offset) {
+                        slot_reloc = &r;
+                        break;
+                    }
+                }
+
+                const char* symbol = "<no-relocation>";
+                uint32_t reloc_type = 0;
+                int64_t addend = 0;
+
+                if (slot_reloc) {
+                    reloc_type = slot_reloc->type;
+                    addend = slot_reloc->addend;
+                    if (reloc_type != R_AARCH64_RELATIVE &&
+                        slot_reloc->sym < plugin.names.size()) {
+                        symbol = plugin.names[slot_reloc->sym].c_str();
+                    }
+                }
+
+                const std::string target_desc = describe(value);
+                const std::string module_desc = skyline_module_address(value);
+                const std::string plugin_desc =
+                    skyline_plugin_address_label(value);
+
+                log("skyline: dispatch-slot plugin=%s offset=0x%llx "
+                    "address=0x%llx value=0x%016llx reloc=%u "
+                    "symbol=%s addend=%lld target=%s module=%s plugin_target=%s",
+                    plugin.name.c_str(),
+                    (unsigned long long)offset,
+                    (unsigned long long)(plugin.base + offset),
+                    (unsigned long long)value,
+                    reloc_type, symbol, (long long)addend,
+                    target_desc.c_str(), module_desc.c_str(),
+                    plugin_desc.c_str());
             }
         }
 
