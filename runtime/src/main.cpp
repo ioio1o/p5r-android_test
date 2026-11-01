@@ -899,6 +899,9 @@ static void skyline_memcpy(CPU& c) {
         return;
     }
 
+    const uint64_t module_base =
+        owner ? owner->base : (main_owner ? g_main->base : 0);
+
     bool pointer_veneer_installed = false;
     uint64_t pointer_veneer = 0;
 
@@ -924,8 +927,6 @@ static void skyline_memcpy(CPU& c) {
     std::memcpy(after, reinterpret_cast<const void*>(dst), preview_size);
     c.x[0] = 0;
 
-    const uint64_t module_base =
-        owner ? owner->base : (main_owner ? g_main->base : 0);
     uint64_t segment_module_offset = segment_offset;
     if (owner) {
         segment_module_offset += segment == Segment::Text
