@@ -196,6 +196,29 @@ static void skyline_load_hook_mode() {
         skyline_hook_mode_name(), path.string().c_str());
 }
 
+static bool skyline_plugin_phase_before_ctors() {
+    static bool loaded = false;
+    static bool before_ctors = false;
+
+    if (!loaded) {
+        loaded = true;
+        const auto path =
+            std::filesystem::u8path(plat::data_root()) /
+            "p5r" / "skyline_plugin_phase.txt";
+
+        std::ifstream file(path);
+        std::string value;
+        if (file >> value)
+            before_ctors = value == "before_ctors";
+
+        log("skyline: plugin phase=%s config=%s",
+            before_ctors ? "before_ctors" : "after_ctors",
+            path.string().c_str());
+    }
+
+    return before_ctors;
+}
+
 template <typename T>
 bool nro_read(const std::vector<uint8_t>& image, uint64_t offset, T& value) {
     if (offset > image.size() || sizeof(T) > image.size() - offset)
@@ -1847,12 +1870,20 @@ static void inspect_skyline_nro(const std::filesystem::path& path) {
 // Run prepared Skyline plugins after game initialization and immediately
 // before entering the real game nnMain.
 static void nn_main(CPU& c) {
+#if NX_NCE
+    const bool plugins_before_ctors =
+        skyline_plugin_phase_before_ctors();
+    if (plugins_before_ctors)
+        run_skyline_plugins(c);
+#endif
+
     init_module(c, *g_sdk);
     init_module(c, *g_main);
     game::after_init();
 
 #if NX_NCE
-    run_skyline_plugins(c);
+    if (!plugins_before_ctors)
+        run_skyline_plugins(c);
 #endif
 
     log("entering nnMain");
