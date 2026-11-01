@@ -482,6 +482,8 @@ struct HookCounter {
     alignas(8) uint64_t hits = 0;
     std::string label;
     std::string kind;
+    uint64_t address = 0;
+    uint64_t module_base = 0;
     uint64_t reported = 0;
     std::atomic<bool> active{false};
 };
@@ -539,7 +541,11 @@ HookCounter* make_hook_counter(const std::string& label, const char* kind) {
 }
 
 HookCounter* make_hook_counter(uint64_t addr, const char* kind) {
-    return make_hook_counter(describe(addr), kind);
+    HookCounter* stat = make_hook_counter(describe(addr), kind);
+    stat->address = addr;
+    const LoadedModule* module = module_at(addr);
+    stat->module_base = module ? module->base : 0;
+    return stat;
 }
 
 void activate_hook_counter(HookCounter* stat) {
@@ -1063,6 +1069,8 @@ uint64_t counting_veneer(uint64_t module_base, uint64_t slot,
 
     HookCounter* counter = make_hook_counter(
         label && *label ? label : describe(slot), "ptr");
+    counter->address = slot;
+    counter->module_base = module_base;
 
     const size_t word_count =
         static_cast<size_t>((veneer - start) / 4) + 10;
@@ -1120,10 +1128,17 @@ uint64_t counting_veneer(uint64_t module_base, uint64_t slot,
     activate_hook_counter(counter);
     g_pointer_veneers[slot] = {target, veneer};
 
-    log("hook %s kind=ptr hits=0",
-        label && *label ? label : describe(slot).c_str());
-    log("nce: pointer veneer installed slot=%s target=%llx veneer=%llx",
+    log("hook %s kind=ptr hits=0 address=0x%016llx "
+        "module_base=0x%016llx offset_base=module_base offset=0x%llx",
         label && *label ? label : describe(slot).c_str(),
+        (unsigned long long)slot,
+        (unsigned long long)module_base,
+        (unsigned long long)(module_base ? slot - module_base : 0));
+    log("nce: pointer veneer installed slot=0x%016llx "
+        "module_base=0x%016llx offset=0x%llx target=0x%016llx veneer=0x%016llx",
+        (unsigned long long)slot,
+        (unsigned long long)module_base,
+        (unsigned long long)(module_base ? slot - module_base : 0),
         (unsigned long long)target,
         (unsigned long long)veneer);
 
@@ -1377,6 +1392,34 @@ uint64_t hook_inline_instruction(uint64_t addr, HleFn fn) {
         (unsigned long long)continuation);
 
     return continuation;
+}
+
+void log_hook_stats(const char* owner) {
+    std::lock_guard lk(g_hook_stats_lock);
+    log("skyline: hook-table begin report=%s kinds=func,ptr "
+        "address_format=absolute offset_base=module_load_base",
+        owner ? owner : "all");
+
+    for (const auto& item : g_hook_stats) {
+        const HookCounter& stat = *item;
+        if (!stat.active.load(std::memory_order_acquire) ||
+            (stat.kind != "func" && stat.kind != "ptr"))
+            continue;
+
+        const uint64_t hits =
+            __atomic_load_n(&stat.hits, __ATOMIC_RELAXED);
+        log("skyline: hook-table report=%s kind=%s label=%s "
+            "address=0x%016llx module_base=0x%016llx "
+            "offset_base=module_base offset=0x%llx hits=%llu",
+            owner ? owner : "all", stat.kind.c_str(), stat.label.c_str(),
+            (unsigned long long)stat.address,
+            (unsigned long long)stat.module_base,
+            (unsigned long long)(stat.module_base
+                ? stat.address - stat.module_base : 0),
+            (unsigned long long)hits);
+    }
+
+    log("skyline: hook-table end report=%s", owner ? owner : "all");
 }
 
 uint64_t tick() { return scaled(cntvct()) - g_tick_off; }

@@ -54,6 +54,9 @@ uint64_t counting_veneer(uint64_t module_base, uint64_t slot,
 uint64_t hook_inline(uint64_t addr, HleFn fn);
 uint64_t hook_inline_instruction(uint64_t addr, HleFn fn);
 
+// Emit a point-in-time function-hook and pointer-veneer hit table.
+void log_hook_stats(const char* owner);
+
 // The Switch's 19.2 MHz system tick, from the host's virtual counter (what the patched mrs CNTPCT_EL0 returns).
 uint64_t tick();
 

@@ -318,6 +318,63 @@ static SkylinePluginRuntime* skyline_plugin_from_address(
     return nullptr;
 }
 
+static bool skyline_module_contains(
+    const ModuleInfo* module, uint64_t address) {
+    if (!module)
+        return false;
+
+    const struct {
+        uint64_t offset;
+        uint64_t size;
+    } ranges[] = {
+        {module->text, module->text_size},
+        {module->ro, module->ro_size},
+        {module->data, module->data_size},
+        {module->bss, module->bss_size},
+    };
+
+    for (const auto& range : ranges) {
+        if (!range.size || range.offset > UINT64_MAX - module->base)
+            continue;
+        const uint64_t begin = module->base + range.offset;
+        if (range.size > UINT64_MAX - begin)
+            continue;
+        if (address >= begin && address - begin < range.size)
+            return true;
+    }
+    return false;
+}
+
+static std::string skyline_module_address(uint64_t address) {
+    const char* name = nullptr;
+    uint64_t base = 0;
+
+    if (SkylinePluginRuntime* plugin =
+            skyline_plugin_from_address(address, false)) {
+        name = plugin->name.c_str();
+        base = plugin->base;
+    } else if (skyline_module_contains(g_main, address)) {
+        name = "main";
+        base = g_main->base;
+    } else if (skyline_module_contains(g_sdk, address)) {
+        name = "sdk";
+        base = g_sdk->base;
+    }
+
+    char result[192]{};
+    if (name) {
+        std::snprintf(result, sizeof(result),
+            "0x%016llx (%s base=0x%016llx offset=0x%llx)",
+            (unsigned long long)address, name,
+            (unsigned long long)base,
+            (unsigned long long)(address - base));
+    } else {
+        std::snprintf(result, sizeof(result), "0x%016llx",
+            (unsigned long long)address);
+    }
+    return result;
+}
+
 static std::string skyline_plugin_address_label(
     uint64_t address, bool return_address = false) {
     SkylinePluginRuntime* plugin =
@@ -345,13 +402,21 @@ static void skyline_record_option(
 
 static void skyline_report_option_diff(
     const SkylinePluginRuntime& plugin) {
-    log("skyline: option-diff begin plugin=%s entries=%zu",
-        plugin.name.c_str(), plugin.option_diff.size());
+    log("skyline: option-diff begin plugin=%s plugin_base=0x%016llx "
+        "main_base=0x%016llx sdk_base=0x%016llx "
+        "address_format=absolute offset_base=module_load_base entries=%zu",
+        plugin.name.c_str(),
+        (unsigned long long)plugin.base,
+        (unsigned long long)(g_main ? g_main->base : 0),
+        (unsigned long long)(g_sdk ? g_sdk->base : 0),
+        plugin.option_diff.size());
 
     for (size_t i = 0; i < plugin.option_diff.size(); ++i)
         log("skyline: option-diff plugin=%s [%zu] %s",
             plugin.name.c_str(), i + 1,
             plugin.option_diff[i].c_str());
+
+    nce::log_hook_stats(plugin.name.c_str());
 
     log("skyline: option-diff end plugin=%s",
         plugin.name.c_str());
@@ -843,9 +908,6 @@ static void skyline_memcpy(CPU& c) {
             owner_name.c_str(),
             (unsigned long long)segment_offset);
 
-        const uint64_t module_base =
-            owner ? owner->base : (main_owner ? g_main->base : 0);
-
         pointer_veneer = nce::counting_veneer(
             module_base, dst, requested_pointer, pointer_label);
 
@@ -862,9 +924,28 @@ static void skyline_memcpy(CPU& c) {
     std::memcpy(after, reinterpret_cast<const void*>(dst), preview_size);
     c.x[0] = 0;
 
-    char patch_label[160]{};
-    std::snprintf(patch_label, sizeof(patch_label), "%s+0x%llx",
-        owner_name.c_str(), (unsigned long long)segment_offset);
+    const uint64_t module_base =
+        owner ? owner->base : (main_owner ? g_main->base : 0);
+    uint64_t segment_module_offset = segment_offset;
+    if (owner) {
+        segment_module_offset += segment == Segment::Text
+            ? owner->info.text
+            : segment == Segment::Ro ? owner->info.ro : owner->info.data;
+    } else if (g_main) {
+        segment_module_offset += segment == Segment::Text
+            ? g_main->text
+            : segment == Segment::Ro ? g_main->ro : g_main->data;
+    }
+    const uint64_t segment_base =
+        module_base ? module_base + segment_module_offset - segment_offset : 0;
+
+    char patch_label[256]{};
+    std::snprintf(patch_label, sizeof(patch_label),
+        "%s+0x%llx(base=0x%016llx addr=0x%016llx)",
+        owner_name.c_str(),
+        (unsigned long long)segment_module_offset,
+        (unsigned long long)module_base,
+        (unsigned long long)dst);
 
     std::vector<uint8_t> written(size);
     std::memcpy(written.data(),
@@ -884,16 +965,31 @@ static void skyline_memcpy(CPU& c) {
 
     if (pointer_write) {
         std::snprintf(option, sizeof(option),
-            "sky_memcpy %s size=%zu value=0x%016llx stored=0x%016llx hash=%016llx",
-            patch_label, size,
+            "sky_memcpy dst=0x%016llx module=%s module_base=0x%016llx "
+            "segment_base=0x%016llx offset_base=module_base "
+            "module_offset=0x%llx segment_offset=0x%llx size=%zu "
+            "value=0x%016llx stored=0x%016llx hash=%016llx",
+            (unsigned long long)dst, owner_name.c_str(),
+            (unsigned long long)module_base,
+            (unsigned long long)segment_base,
+            (unsigned long long)segment_module_offset,
+            (unsigned long long)segment_offset, size,
             (unsigned long long)requested_pointer,
             (unsigned long long)(pointer_veneer_installed
                 ? pointer_veneer : requested_pointer),
             (unsigned long long)hash);
     } else {
         std::snprintf(option, sizeof(option),
-            "sky_memcpy %s size=%zu bytes=%s hash=%016llx",
-            patch_label, size, skyline_patch_value(written).c_str(),
+            "sky_memcpy dst=0x%016llx module=%s module_base=0x%016llx "
+            "segment_base=0x%016llx offset_base=module_base "
+            "module_offset=0x%llx segment_offset=0x%llx size=%zu "
+            "bytes=%s hash=%016llx",
+            (unsigned long long)dst, owner_name.c_str(),
+            (unsigned long long)module_base,
+            (unsigned long long)segment_base,
+            (unsigned long long)segment_module_offset,
+            (unsigned long long)segment_offset, size,
+            skyline_patch_value(written).c_str(),
             (unsigned long long)hash);
     }
 
@@ -1003,8 +1099,9 @@ static void skyline_a64_hook_function(CPU& c) {
     const std::string caller_owner = skyline_plugin_address_label(caller, true);
 
     skyline_record_option(caller, true,
-        "A64HookFunction target=" + describe(target) +
-        " replacement=" + skyline_plugin_address_label(replacement));
+        "A64HookFunction caller=" + skyline_module_address(caller) +
+        " target=" + skyline_module_address(target) +
+        " replacement=" + skyline_module_address(replacement));
 
     skyline_log_hook_target("A64HookFunction", target);
     log("skyline: hook-register api=A64HookFunction owner=%s caller=%llx "
@@ -1065,6 +1162,67 @@ static void skyline_a64_hook_function(CPU& c) {
 }
 
 
+struct alignas(16) SkylineInlineCtx {
+    uint64_t x[31];
+    uint64_t sp;
+    V128 v[32];
+};
+static_assert(sizeof(SkylineInlineCtx) == 0x300);
+
+static uint64_t g_skyline_bl_inline_invocations = 0;
+
+static void skyline_log_inline_ctx_diff(
+    const char* hook, uint64_t target, uint64_t invocation,
+    const uint64_t* before_x, uint64_t before_sp, const V128* before_v,
+    const SkylineInlineCtx& after) {
+    log("skyline: inline-diff begin hook=%s target=%s invocation=%llu "
+        "comparison=InlineCtx",
+        hook, skyline_module_address(target).c_str(),
+        (unsigned long long)invocation);
+
+    unsigned changed = 0;
+    for (unsigned i = 0; i < 31; ++i) {
+        if (before_x[i] == after.x[i])
+            continue;
+        ++changed;
+        log("skyline: inline-diff hook=%s target=0x%016llx invocation=%llu "
+            "reg=x%u old=0x%016llx new=0x%016llx",
+            hook, (unsigned long long)target,
+            (unsigned long long)invocation, i,
+            (unsigned long long)before_x[i],
+            (unsigned long long)after.x[i]);
+    }
+
+    if (before_sp != after.sp) {
+        ++changed;
+        log("skyline: inline-diff hook=%s target=0x%016llx invocation=%llu "
+            "reg=sp old=0x%016llx new=0x%016llx",
+            hook, (unsigned long long)target,
+            (unsigned long long)invocation,
+            (unsigned long long)before_sp,
+            (unsigned long long)after.sp);
+    }
+
+    for (unsigned i = 0; i < 32; ++i) {
+        if (std::memcmp(&before_v[i], &after.v[i], sizeof(V128)) == 0)
+            continue;
+        ++changed;
+        log("skyline: inline-diff hook=%s target=0x%016llx invocation=%llu "
+            "reg=v%u old=0x%016llx%016llx new=0x%016llx%016llx",
+            hook, (unsigned long long)target,
+            (unsigned long long)invocation, i,
+            (unsigned long long)before_v[i].u64[1],
+            (unsigned long long)before_v[i].u64[0],
+            (unsigned long long)after.v[i].u64[1],
+            (unsigned long long)after.v[i].u64[0]);
+    }
+
+    log("skyline: inline-diff end hook=%s target=0x%016llx "
+        "invocation=%llu changed_registers=%u",
+        hook, (unsigned long long)target,
+        (unsigned long long)invocation, changed);
+}
+
 static uint64_t g_skyline_inline_replacement = 0;
 static uint64_t g_skyline_inline_continuation = 0;
 
@@ -1117,12 +1275,7 @@ static void skyline_inline_hook_callback(CPU& c) {
         return;
     }
 
-    struct alignas(16) InlineCtx {
-        uint64_t x[31];
-        uint64_t sp;
-        V128 v[32];
-    };
-    static_assert(sizeof(InlineCtx) == 0x300);
+    using InlineCtx = SkylineInlineCtx;
 
     const uint64_t original_sp = c.x[31];
     if (original_sp < sizeof(InlineCtx)) {
@@ -1147,6 +1300,12 @@ static void skyline_inline_hook_callback(CPU& c) {
     inline_context->sp = original_sp;
     std::memcpy(inline_context->v, c.v, sizeof(inline_context->v));
 
+    uint64_t before_x[31]{};
+    V128 before_v[32]{};
+    std::memcpy(before_x, inline_context->x, sizeof(before_x));
+    std::memcpy(before_v, inline_context->v, sizeof(before_v));
+    const uint64_t invocation = __atomic_add_fetch(&g_skyline_bl_inline_invocations, uint64_t(1), __ATOMIC_RELAXED);
+
     c.x[0] = inline_context_address;
     c.x[31] = inline_context_address;
 
@@ -1159,6 +1318,11 @@ static void skyline_inline_hook_callback(CPU& c) {
             (unsigned long long)inline_context_address);
 
     call(c, replacement);
+
+    if (invocation <= 50)
+        skyline_log_inline_ctx_diff(
+            "BL", g_main ? g_main->base + 0x8a9134 : 0,
+            invocation, before_x, original_sp, before_v, *inline_context);
 
     // InlineCtx edits to x0..x30 and v0..v31 are visible to the interrupted
     // code. Its SP field is informational: restore the original guest SP.
@@ -1179,7 +1343,10 @@ struct SkylineGenericInlineHook {
     uint64_t target;
     uint64_t continuation;
     uint64_t replacement;
+    uint64_t invocations = 0;
 };
+
+
 
 static SkylineGenericInlineHook g_skyline_generic_inline_hooks[64]{};
 static uint32_t g_skyline_generic_inline_hook_count = 0;
@@ -1189,9 +1356,11 @@ static void skyline_generic_inline_hook_callback(CPU& c) {
     const uint64_t saved_stack_sp = c.x[31];
 
     uint64_t replacement = 0;
+    SkylineGenericInlineHook* hook = nullptr;
     for (uint32_t i = 0; i < g_skyline_generic_inline_hook_count; ++i) {
         if (g_skyline_generic_inline_hooks[i].continuation == continuation) {
-            replacement = g_skyline_generic_inline_hooks[i].replacement;
+            hook = &g_skyline_generic_inline_hooks[i];
+            replacement = hook->replacement;
             break;
         }
     }
@@ -1232,12 +1401,7 @@ static void skyline_generic_inline_hook_callback(CPU& c) {
 
     const uint64_t original_sp = saved_stack_sp + 16;
 
-    struct alignas(16) InlineCtx {
-        uint64_t x[31];
-        uint64_t sp;
-        V128 v[32];
-    };
-    static_assert(sizeof(InlineCtx) == 0x300);
+    using InlineCtx = SkylineInlineCtx;
 
     if (original_sp < sizeof(InlineCtx)) {
         if (emit)
@@ -1256,6 +1420,12 @@ static void skyline_generic_inline_hook_callback(CPU& c) {
     context->sp = original_sp;
     std::memcpy(context->v, c.v, sizeof(context->v));
 
+    uint64_t before_x[31]{};
+    V128 before_v[32]{};
+    std::memcpy(before_x, context->x, sizeof(before_x));
+    std::memcpy(before_v, context->v, sizeof(before_v));
+    const uint64_t invocation = __atomic_add_fetch(&hook->invocations, uint64_t(1), __ATOMIC_RELAXED);
+
     c.x[0] = context_address;
     c.x[31] = context_address;
 
@@ -1267,6 +1437,11 @@ static void skyline_generic_inline_hook_callback(CPU& c) {
             (unsigned long long)original_x30);
 
     call(c, replacement);
+
+    if (invocation <= 50)
+        skyline_log_inline_ctx_diff(
+            "generic", hook->target, invocation,
+            before_x, original_sp, before_v, *context);
 
     // Apply edits to x0-x29 and all vector registers. The replacement's
     // SP and LR edits are deliberately ignored for this trampoline type.
@@ -1297,8 +1472,9 @@ static void skyline_a64_inline_hook(CPU& c) {
     const std::string caller_owner = skyline_plugin_address_label(caller, true);
 
     skyline_record_option(caller, true,
-        "A64InlineHook target=" + describe(target) +
-        " replacement=" + skyline_plugin_address_label(replacement));
+        "A64InlineHook caller=" + skyline_module_address(caller) +
+        " target=" + skyline_module_address(target) +
+        " replacement=" + skyline_module_address(replacement));
 
     skyline_log_hook_target("A64InlineHook", target);
     log("skyline: hook-register api=A64InlineHook owner=%s caller=%llx "
