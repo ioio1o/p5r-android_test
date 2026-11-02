@@ -1251,30 +1251,71 @@ static void skyline_log_inline_memory(
     static const char* const names[3] = {"x19", "x0", "x1"};
     for (unsigned k = 0; k < 3; ++k) {
         const uint64_t address = addresses[k];
-        if (!guest_range_ok(address, 64, 1)) {
+        const size_t total_size = k == 0 ? 256 : 64;
+        if (!guest_range_ok(address, total_size, 1)) {
             log("plugin-trace inline-memory hook=%s target=0x%llx "
-                "invocation=%llu phase=%s reg=%s address=0x%llx unreadable",
+                "invocation=%llu phase=%s reg=%s address=0x%llx "
+                "size=%zu unreadable",
                 hook, (unsigned long long)target,
                 (unsigned long long)invocation, phase, names[k],
+                (unsigned long long)address, total_size);
+            continue;
+        }
+
+        for (size_t offset = 0; offset < total_size; offset += 32) {
+            uint8_t bytes[32]{};
+            std::memcpy(bytes,
+                reinterpret_cast<const void*>(address + offset),
+                sizeof(bytes));
+            char hex[32 * 3 + 1]{};
+            size_t used = 0;
+            for (size_t i = 0; i < sizeof(bytes); ++i) {
+                const int n = std::snprintf(hex + used, sizeof(hex) - used,
+                    "%02x%s", bytes[i], i + 1 == sizeof(bytes) ? "" : " ");
+                if (n <= 0) break;
+                used += size_t(n);
+            }
+            log("plugin-trace inline-memory hook=%s target=0x%llx "
+                "invocation=%llu phase=%s reg=%s address=0x%llx "
+                "size=%zu offset=0x%zx bytes=%s",
+                hook, (unsigned long long)target,
+                (unsigned long long)invocation, phase, names[k],
+                (unsigned long long)address, total_size, offset, hex);
+        }
+    }
+}
+
+static void skyline_log_bonus_config(
+    uint64_t target, uint64_t invocation,
+    const char* phase, uint64_t plugin_base) {
+    struct ConfigByte {
+        const char* name;
+        uint64_t offset;
+    };
+    static constexpr ConfigByte bytes[] = {
+        {"callback-config-ro", 0x4d3fc},
+        {"callback-state-byte", 0x510d4},
+    };
+
+    for (const auto& item : bytes) {
+        const uint64_t address = plugin_base + item.offset;
+        if (!guest_range_ok(address, 1, 1)) {
+            log("plugin-trace callback-config target=0x%llx "
+                "invocation=%llu phase=%s name=%s address=0x%llx unreadable",
+                (unsigned long long)target,
+                (unsigned long long)invocation, phase, item.name,
                 (unsigned long long)address);
             continue;
         }
 
-        uint8_t bytes[64]{};
-        std::memcpy(bytes, reinterpret_cast<const void*>(address), sizeof(bytes));
-        char hex[64 * 3 + 1]{};
-        size_t used = 0;
-        for (size_t i = 0; i < sizeof(bytes); ++i) {
-            const int n = std::snprintf(hex + used, sizeof(hex) - used,
-                "%02x%s", bytes[i], i + 1 == sizeof(bytes) ? "" : " ");
-            if (n <= 0) break;
-            used += size_t(n);
-        }
-        log("plugin-trace inline-memory hook=%s target=0x%llx "
-            "invocation=%llu phase=%s reg=%s address=0x%llx bytes=%s",
-            hook, (unsigned long long)target,
-            (unsigned long long)invocation, phase, names[k],
-            (unsigned long long)address, hex);
+        log("plugin-trace callback-config target=0x%llx "
+            "invocation=%llu phase=%s name=%s address=0x%llx "
+            "offset=0x%llx value=0x%02x",
+            (unsigned long long)target,
+            (unsigned long long)invocation, phase, item.name,
+            (unsigned long long)address,
+            (unsigned long long)item.offset,
+            unsigned(ld<uint8_t>(address)));
     }
 }
 
@@ -1514,23 +1555,78 @@ static void skyline_generic_inline_hook_callback(CPU& c) {
     const uint64_t trace_addresses[3] = {
         context->x[19], context->x[0], context->x[1]
     };
-    if (invocation <= 3) {
+    SkylinePluginRuntime* callback_plugin =
+        skyline_plugin_from_address(replacement);
+    const bool trace_bonus_callback =
+        g_main &&
+        hook->target == g_main->base + 0xcc2d1c &&
+        callback_plugin &&
+        callback_plugin->name == "libp5r_bdsm.nro";
+
+    if (trace_bonus_callback)
+        log("plugin-trace callback-enter name=%s target=0x%llx "
+            "invocation=%llu replacement=%s w8=0x%08x x8=0x%016llx "
+            "x19=0x%016llx x0=0x%016llx x1=0x%016llx",
+            callback_plugin->name.c_str(),
+            (unsigned long long)hook->target,
+            (unsigned long long)invocation,
+            skyline_plugin_address_label(replacement).c_str(),
+            unsigned(context->x[8] & 0xffffffffu),
+            (unsigned long long)context->x[8],
+            (unsigned long long)context->x[19],
+            (unsigned long long)context->x[0],
+            (unsigned long long)context->x[1]);
+
+    auto invoke_replacement = [&]() {
+        if (invocation <= 3)
+            skyline_log_inline_ctx_raw("generic", hook->target, invocation,
+                "before", *context);
+
+        if (trace_bonus_callback || invocation <= 3) {
+            skyline_log_inline_memory("generic", hook->target, invocation,
+                "before", trace_addresses);
+            if (trace_bonus_callback)
+                skyline_log_bonus_config(hook->target, invocation,
+                    "before", callback_plugin->base);
+        }
+
+        call(c, replacement);
+
+        if (invocation <= 3)
+            skyline_log_inline_ctx_raw("generic", hook->target, invocation,
+                "after", *context);
+
+        if (trace_bonus_callback || invocation <= 3) {
+            const uint64_t after_addresses[3] = {
+                context->x[19], context->x[0], context->x[1]
+            };
+            skyline_log_inline_memory("generic", hook->target, invocation,
+                "after", after_addresses);
+            if (trace_bonus_callback)
+                skyline_log_bonus_config(hook->target, invocation,
+                    "after", callback_plugin->base);
+        }
+    };
+
+    if (trace_bonus_callback || invocation <= 3) {
         PluginTraceScope trace("generic", hook->target, invocation);
-        skyline_log_inline_ctx_raw("generic", hook->target, invocation,
-            "before", *context);
-        skyline_log_inline_memory("generic", hook->target, invocation,
-            "before", trace_addresses);
-        call(c, replacement);
-        skyline_log_inline_ctx_raw("generic", hook->target, invocation,
-            "after", *context);
-          const uint64_t after_addresses[3] = {
-              context->x[19], context->x[0], context->x[1]
-          };
-          skyline_log_inline_memory("generic", hook->target, invocation,
-              "after", after_addresses);
+        invoke_replacement();
     } else {
-        call(c, replacement);
+        invoke_replacement();
     }
+
+    if (trace_bonus_callback)
+        log("plugin-trace callback-exit name=%s target=0x%llx "
+            "invocation=%llu w8=0x%08x x8=0x%016llx "
+            "x19=0x%016llx x0=0x%016llx x1=0x%016llx",
+            callback_plugin->name.c_str(),
+            (unsigned long long)hook->target,
+            (unsigned long long)invocation,
+            unsigned(context->x[8] & 0xffffffffu),
+            (unsigned long long)context->x[8],
+            (unsigned long long)context->x[19],
+            (unsigned long long)context->x[0],
+            (unsigned long long)context->x[1]);
 
     if (invocation <= 50)
         skyline_log_inline_ctx_diff(
@@ -2534,7 +2630,7 @@ static void skyline_trace_generate_random_bytes(CPU& c) {
     call(c, g_random_bytes_original);
     const uint64_t x0_after = c.x[0];
 
-    uint8_t bytes[16]{};
+    uint8_t bytes[32]{};
     const size_t count = static_cast<size_t>(
         std::min<uint64_t>(requested_size, sizeof(bytes)));
 
@@ -2548,7 +2644,7 @@ static void skyline_trace_generate_random_bytes(CPU& c) {
                     count);
     }
 
-    char hex[16 * 3 + 1]{};
+    char hex[32 * 3 + 1]{};
     size_t used = 0;
 
     for (size_t i = 0; i < count; ++i) {
@@ -2562,9 +2658,17 @@ static void skyline_trace_generate_random_bytes(CPU& c) {
         used += static_cast<size_t>(n);
     }
 
+    const bool inside_bonus_callback =
+        plugin_trace_active() &&
+        plugin_trace_hook() &&
+        std::strcmp(plugin_trace_hook(), "generic") == 0 &&
+        g_main &&
+        plugin_trace_target() == g_main->base + 0xcc2d1c;
+
     log("skyline: random-bytes invocation=%llu "
         "caller=0x%016llx (%s) destination=0x%016llx "
         "size=%llu x0_after=0x%llx output_size=%zu output=[%s] "
+        "callback=%s callback_invocation=%llu callback_target=0x%llx "
         "plugin_trace=%s plugin_target=0x%llx",
         (unsigned long long)invocation,
         (unsigned long long)caller,
@@ -2573,6 +2677,11 @@ static void skyline_trace_generate_random_bytes(CPU& c) {
         (unsigned long long)requested_size,
         (unsigned long long)x0_after,
         count, output_readable ? hex : "<unreadable>",
+        inside_bonus_callback ? "inside" : "outside",
+        (unsigned long long)(plugin_trace_active()
+            ? plugin_trace_invocation() : 0),
+        (unsigned long long)(plugin_trace_active()
+            ? plugin_trace_target() : 0),
         plugin_trace_active() ? plugin_trace_hook() : "none",
         (unsigned long long)plugin_trace_target());
 }
