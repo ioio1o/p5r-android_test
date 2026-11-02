@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1502,6 +1503,120 @@ struct SkylineGenericInlineHook {
 static SkylineGenericInlineHook g_skyline_generic_inline_hooks[64]{};
 static uint32_t g_skyline_generic_inline_hook_count = 0;
 
+struct SkylineInlineOverride {
+    bool loaded = false;
+    bool valid = false;
+    std::string module;
+    uint64_t offset = 0;
+    uint32_t value = 0;
+};
+
+static SkylineInlineOverride g_skyline_inline_override;
+
+static void skyline_load_inline_override() {
+    auto& config = g_skyline_inline_override;
+    if (config.loaded)
+        return;
+    config.loaded = true;
+
+    const auto path =
+        std::filesystem::u8path(plat::data_root()) /
+        "p5r" / "skyline_inline_override.txt";
+
+    std::ifstream file(path);
+    std::string line;
+    while (std::getline(file, line)) {
+        const size_t first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos || line[first] == '#')
+            continue;
+
+        std::istringstream input(line.substr(first));
+        std::string module_offset;
+        std::string assignment;
+        std::string extra;
+        if (!(input >> module_offset >> assignment) || (input >> extra)) {
+            log("skyline: inline-override malformed config=%s",
+                path.string().c_str());
+            return;
+        }
+
+        const size_t plus = module_offset.find('+');
+        if (plus == std::string::npos || plus == 0 ||
+            assignment.rfind("w8=", 0) != 0) {
+            log("skyline: inline-override malformed config=%s",
+                path.string().c_str());
+            return;
+        }
+
+        const std::string module = module_offset.substr(0, plus);
+        const std::string offset_text = module_offset.substr(plus + 1);
+        const std::string value_text = assignment.substr(3);
+        char* offset_end = nullptr;
+        char* value_end = nullptr;
+        const unsigned long long offset =
+            std::strtoull(offset_text.c_str(), &offset_end, 0);
+        const unsigned long long value =
+            std::strtoull(value_text.c_str(), &value_end, 0);
+
+        if (!offset_end || offset_end == offset_text.c_str() ||
+            *offset_end || !value_end ||
+            value_end == value_text.c_str() || *value_end ||
+            value > UINT32_MAX) {
+            log("skyline: inline-override invalid numeric value config=%s",
+                path.string().c_str());
+            return;
+        }
+
+        config.module = module;
+        config.offset = static_cast<uint64_t>(offset);
+        config.value = static_cast<uint32_t>(value);
+        config.valid = true;
+        log("skyline: inline-override loaded target=%s+0x%llx w8=0x%08x "
+            "config=%s",
+            config.module.c_str(),
+            (unsigned long long)config.offset,
+            config.value, path.string().c_str());
+        return;
+    }
+
+    log("skyline: inline-override disabled config=%s",
+        path.string().c_str());
+}
+
+static void skyline_apply_inline_override(
+    uint64_t target, SkylineInlineCtx& context, uint64_t invocation) {
+    skyline_load_inline_override();
+    const auto& config = g_skyline_inline_override;
+    if (!config.valid)
+        return;
+
+    uint64_t base = 0;
+    if (config.module == "main" && g_main)
+        base = g_main->base;
+    else if (config.module == "sdk" && g_sdk)
+        base = g_sdk->base;
+    else {
+        for (const auto& owned : g_skyline_plugins) {
+            if (owned && owned->name == config.module) {
+                base = owned->base;
+                break;
+            }
+        }
+    }
+
+    if (!base || config.offset > UINT64_MAX - base ||
+        target != base + config.offset)
+        return;
+
+    const uint64_t previous = context.x[8];
+    context.x[8] = config.value; // AArch64 W-register write zero-extends.
+    log("skyline: inline-override applied target=%s invocation=%llu "
+        "w8_before=0x%08x w8_after=0x%08x",
+        skyline_module_address(target).c_str(),
+        (unsigned long long)invocation,
+        unsigned(previous & 0xffffffffu), config.value);
+}
+
 static long skyline_current_tid() {
 #if defined(__linux__)
     return static_cast<long>(::syscall(SYS_gettid));
@@ -1520,6 +1635,63 @@ struct SkylineTraceProbe {
 
 static SkylineTraceProbe g_skyline_trace_probes[32]{};
 static uint32_t g_skyline_trace_probe_count = 0;
+
+// Tracks the arithmetic immediately before the callback's byte store.
+static uint64_t g_callback_multiply_x9 = 0;
+static uint64_t g_callback_multiply_result = 0;
+static bool g_callback_multiply_pending = false;
+static bool g_callback_sampled_this_boot = false;
+static thread_local uint64_t g_skyline_active_inline_ctx_address = 0;
+
+static uint64_t skyline_callback_claim_sample() {
+    namespace fs = std::filesystem;
+    const fs::path directory =
+        fs::u8path(plat::data_root()) / "p5r";
+    const fs::path path = directory / "skyline_callback_sample_count.txt";
+
+    std::error_code ec;
+    fs::create_directories(directory, ec);
+    if (ec) {
+        log("plugin-trace callback-counter mkdir-failed path=%s error=%s",
+            directory.string().c_str(), ec.message().c_str());
+        return 0;
+    }
+
+    uint64_t count = 0;
+    {
+        std::ifstream input(path);
+        if (input >> count) {
+            std::string extra;
+            if (input >> extra) {
+                log("plugin-trace callback-counter invalid content path=%s",
+                    path.string().c_str());
+                return 0;
+            }
+        } else if (input.bad()) {
+            log("plugin-trace callback-counter read-failed path=%s",
+                path.string().c_str());
+            return 0;
+        }
+    }
+
+    if (count >= 5) {
+        log("plugin-trace callback-counter complete count=%llu path=%s",
+            (unsigned long long)count, path.string().c_str());
+        return 0;
+    }
+
+    const uint64_t next = count + 1;
+    {
+        std::ofstream output(path, std::ios::trunc);
+        if (!output || !(output << next << '\n')) {
+            log("plugin-trace callback-counter write-failed path=%s",
+                path.string().c_str());
+            return 0;
+        }
+    }
+
+    return next;
+}
 
 struct BonusCallbackWatch {
     bool active = false;
@@ -1951,6 +2123,82 @@ static void skyline_trace_probe(CPU& c) {
         const uint64_t hit = __atomic_add_fetch(
             &probe.hits, uint64_t(1), __ATOMIC_RELAXED);
 
+        if (std::strcmp(probe.label, "callback-multiply") == 0) {
+            // The instruction at 0xdc3c is ADD x22, x9, x9, LSL #1.
+            // Save its operands/result for the accepted candidate reaching
+            // the post-store probe at 0xdcb0.
+            g_callback_multiply_x9 = c.x[9];
+            g_callback_multiply_result =
+                c.x[9] + (c.x[9] << 1);
+            g_callback_multiply_pending = true;
+        } else if (
+            std::strcmp(probe.label, "callback-config-after") == 0 &&
+            g_callback_multiply_pending &&
+            !g_callback_sampled_this_boot) {
+
+            const uint64_t x21 = c.x[21];
+            const bool address_valid = x21 <= UINT64_MAX - 212;
+            const uint64_t store_address =
+                address_valid ? x21 + 212 : 0;
+            uint8_t stored_byte = 0;
+            const bool byte_readable =
+                store_address && guest_range_ok(store_address, 1, 1);
+
+            if (byte_readable) {
+                std::memcpy(&stored_byte,
+                    reinterpret_cast<const void*>(store_address), 1);
+            }
+
+            const uint64_t ordinal = byte_readable
+                ? skyline_callback_claim_sample() : 0;
+
+            if (ordinal) {
+                g_callback_sampled_this_boot = true;
+
+                std::string region = skyline_module_address(x21);
+                const uint64_t inline_ctx_begin =
+                    g_skyline_active_inline_ctx_address;
+                if (inline_ctx_begin &&
+                    x21 >= inline_ctx_begin &&
+                    x21 - inline_ctx_begin < sizeof(SkylineInlineCtx)) {
+                    char detail[96]{};
+                    std::snprintf(detail, sizeof(detail),
+                        "InlineCtx+0x%llx",
+                        (unsigned long long)(x21 - inline_ctx_begin));
+                    region = detail;
+                } else if (SkylinePluginRuntime* owner =
+                        skyline_plugin_containing_address(x21)) {
+                    char detail[192]{};
+                    std::snprintf(detail, sizeof(detail),
+                        "plugin=%s base=0x%016llx offset=0x%llx",
+                        owner->name.c_str(),
+                        (unsigned long long)owner->base,
+                        (unsigned long long)(x21 - owner->base));
+                    region = detail;
+                }
+
+                const uint64_t shifted = g_callback_multiply_x9 << 1;
+                log("plugin-trace callback-sample ordinal=%llu "
+                    "probe_hit=%llu instruction=plugin+0xdc3c "
+                    "operation=add-x9-x9-shift-1 "
+                    "operand_x9=0x%016llx operand_x9_shifted=0x%016llx "
+                    "calculated_x22=0x%016llx actual_x22=0x%016llx "
+                    "x21=0x%016llx x21_region=%s "
+                    "store_address=0x%016llx stored_byte=0x%02x",
+                    (unsigned long long)ordinal,
+                    (unsigned long long)hit,
+                    (unsigned long long)g_callback_multiply_x9,
+                    (unsigned long long)shifted,
+                    (unsigned long long)g_callback_multiply_result,
+                    (unsigned long long)c.x[22],
+                    (unsigned long long)x21,
+                    region.c_str(),
+                    (unsigned long long)store_address,
+                    unsigned(stored_byte));
+            }
+            g_callback_multiply_pending = false;
+        }
+
         const bool keep_twenty =
             std::strcmp(probe.label, "callback-config-write") == 0 ||
             std::strcmp(probe.label, "callback-config-after") == 0;
@@ -2028,6 +2276,7 @@ static void skyline_install_bonus_trace_probes(
 
     static constexpr ProbeSpec probes[] = {
         {0x0db58, "callback-entry"},
+        {0x0dc3c, "callback-multiply"},
         {0x0dc10, "callback-after-helper-B"},
         {0x0dc2c, "callback-after-helper-A"},
         {0x0dc40, "callback-loop-block"},
@@ -2227,12 +2476,18 @@ static void skyline_generic_inline_hook_callback(CPU& c) {
         }
     };
 
+    const uint64_t previous_inline_ctx =
+        g_skyline_active_inline_ctx_address;
+    g_skyline_active_inline_ctx_address = context_address;
+
     if (trace_bonus_callback || invocation <= 3) {
         PluginTraceScope trace("generic", hook->target, invocation);
         invoke_replacement();
     } else {
         invoke_replacement();
     }
+
+    g_skyline_active_inline_ctx_address = previous_inline_ctx;
 
     if (trace_bonus_callback)
         log("plugin-trace callback-exit name=%s target=0x%llx "
@@ -2252,6 +2507,10 @@ static void skyline_generic_inline_hook_callback(CPU& c) {
         skyline_log_inline_ctx_diff(
             "generic", hook->target, invocation,
             before_x, original_sp, before_v, *context);
+
+    // Apply the optional test override after plugin execution and directly
+    // before restoring InlineCtx into the interrupted CPU state.
+    skyline_apply_inline_override(hook->target, *context, invocation);
 
     // Apply edits to x0-x29 and all vector registers. The replacement's
     // SP and LR edits are deliberately ignored for this trampoline type.
