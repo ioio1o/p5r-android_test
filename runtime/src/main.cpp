@@ -1629,6 +1629,29 @@ static void skyline_install_bonus_trace_probes(
     if (plugin_name != "libp5r_bdsm.nro")
         return;
 
+    // Dump the loaded Bonus callback instructions before installing probes.
+    // These are NRO load-base-relative offsets, not file offsets.
+    for (uint64_t offset = 0x0dbf0; offset <= 0x0dc40; offset += 4) {
+        const uint64_t address = module.base + offset;
+        uint32_t instruction = 0;
+
+        if (!guest_range_ok(address, sizeof(instruction), 1)) {
+            log("plugin-trace instruction offset=0x%llx unreadable",
+                (unsigned long long)offset);
+            continue;
+        }
+
+        std::memcpy(&instruction,
+            reinterpret_cast<const void*>(address), sizeof(instruction));
+
+        log("plugin-trace instruction plugin=%s offset=0x%llx "
+            "address=0x%016llx word=%08x",
+            plugin_name.c_str(),
+            (unsigned long long)offset,
+            (unsigned long long)address,
+            instruction);
+    }
+
     struct ProbeSpec {
         uint64_t offset;
         const char* label;
