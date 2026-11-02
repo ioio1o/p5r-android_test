@@ -1561,6 +1561,49 @@ static void skyline_trace_probe_detail(
             fields[3], fields[4], fields[5]);
     }
 
+    const bool capture_callback_state =
+        std::strcmp(label, "callback-loop-block") == 0 ||
+        std::strcmp(label, "callback-after-helper-3caa0") == 0 ||
+        std::strcmp(label, "callback-config-write") == 0 ||
+        std::strcmp(label, "callback-config-after") == 0;
+
+    if (capture_callback_state) {
+        auto dump_bytes = [&](const char* name, uint64_t address,
+                              size_t size) {
+            uint8_t bytes[64]{};
+            if (size > sizeof(bytes) ||
+                !guest_range_ok(address, size, 1)) {
+                log("plugin-trace memory label=%s region=%s "
+                    "address=0x%llx unreadable",
+                    label, name, (unsigned long long)address);
+                return;
+            }
+
+            std::memcpy(bytes, reinterpret_cast<const void*>(address), size);
+
+            char hex[sizeof(bytes) * 3]{};
+            size_t used = 0;
+            for (size_t i = 0; i < size; ++i) {
+                const int n = std::snprintf(
+                    hex + used, sizeof(hex) - used,
+                    "%s%02x", i ? " " : "", unsigned(bytes[i]));
+                if (n <= 0 || static_cast<size_t>(n) >= sizeof(hex) - used)
+                    break;
+                used += static_cast<size_t>(n);
+            }
+
+            log("plugin-trace memory label=%s region=%s "
+                "address=0x%llx size=%zu bytes=[%s]",
+                label, name, (unsigned long long)address, size, hex);
+        };
+
+        if (c.x[19] <= UINT64_MAX - 0x118)
+            dump_bytes("random-state", c.x[19] + 0x118, 32);
+
+        if (c.x[21] <= UINT64_MAX - 192)
+            dump_bytes("config-window", c.x[21] + 192, 64);
+    }
+
     if (std::strcmp(label, "callback-config-write") == 0 ||
         std::strcmp(label, "callback-config-after") == 0) {
         uint8_t value = 0;
@@ -1599,7 +1642,8 @@ static void skyline_trace_probe(CPU& c) {
                 "offset=0x%llx hit=%llu tid=%ld "
                 "scope=%s scope_target=0x%llx scope_invocation=%llu "
                 "caller_lr=0x%llx x0=0x%llx x1=0x%llx "
-                "x8=0x%llx x19=0x%llx x20=0x%llx "
+                "x8=0x%llx x9=0x%llx x10=0x%llx "
+                "x19=0x%llx x20=0x%llx "
                 "x21=0x%llx x22=0x%llx",
                 probe.label,
                 (unsigned long long)probe.target,
@@ -1613,6 +1657,8 @@ static void skyline_trace_probe(CPU& c) {
                 (unsigned long long)c.x[0],
                 (unsigned long long)c.x[1],
                 (unsigned long long)c.x[8],
+                (unsigned long long)c.x[9],
+                (unsigned long long)c.x[10],
                 (unsigned long long)c.x[19],
                 (unsigned long long)c.x[20],
                 (unsigned long long)c.x[21],
@@ -1631,7 +1677,7 @@ static void skyline_install_bonus_trace_probes(
 
     // Dump the loaded Bonus callback instructions before installing probes.
     // These are NRO load-base-relative offsets, not file offsets.
-    for (uint64_t offset = 0x0dbf0; offset <= 0x0dc40; offset += 4) {
+    for (uint64_t offset = 0x0dbf0; offset <= 0x0dcb0; offset += 4) {
         const uint64_t address = module.base + offset;
         uint32_t instruction = 0;
 
