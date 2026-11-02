@@ -2,6 +2,7 @@
 // game, and what only P5R needs. The game draws through NVN (Atlus' GFD engine); its shaders live in the GFD shader
 // caches BASE/GFDNXHHPRESET*.GSC of ALL_USEU.CPK (tools/gsc_shaders.py). Notes: games/p5r/PROGRESO.md.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -122,6 +123,7 @@ bool auto_fps() {
     return on;
 }
 
+std::atomic<bool> g_title_screen_active{false};
 bool g_scene = false;  // scan_tasks: the title or a cutscene is running, and no battle
 bool g_field_scene = false;  // scan_tasks: a scripted field scene (EventSkip, no event_proc, no battle): steps only
 
@@ -301,6 +303,7 @@ void scan_tasks() {
         for (char& ch : str) if (ch == ' ') ch = '_';
         cur.push_back(str.empty() ? "?" : str);
     }
+    g_title_screen_active.store(title, std::memory_order_release);
     const bool scene = (title || event) && !battle;
     static const bool field_on = env_int("NX_P5R_FIELD_SCENES", 1) != 0;
     const bool field = field_on && skip && !event && !title && !battle;
@@ -512,6 +515,10 @@ void cull_job_hook(CPU& c) {
 }
 
 }  // namespace
+
+bool game::title_screen_active() {
+    return g_title_screen_active.load(std::memory_order_acquire);
+}
 
 NX_HLE("fputs", fputs_logged);
 

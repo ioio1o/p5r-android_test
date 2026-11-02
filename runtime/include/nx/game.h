@@ -27,6 +27,7 @@ void after_init();
 // The game starts its renderer (vkCreateInstance): settings the engine may have reset while loading its config.
 void renderer_start();
 // The first frame was presented.
+bool title_screen_active();
 void first_frame();
 
 }  // namespace nx::game

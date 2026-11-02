@@ -323,6 +323,36 @@ static SkylinePluginRuntime* skyline_plugin_from_address(
     return nullptr;
 }
 
+static SkylinePluginRuntime* skyline_plugin_containing_address(
+    uint64_t address) {
+    for (const auto& owned : g_skyline_plugins) {
+        if (!owned)
+            continue;
+
+        SkylinePluginRuntime& plugin = *owned;
+        const struct {
+            uint64_t offset;
+            uint64_t size;
+        } ranges[] = {
+            {plugin.info.text, plugin.info.text_size},
+            {plugin.info.ro, plugin.info.ro_size},
+            {plugin.info.data, plugin.info.data_size},
+            {plugin.info.bss, plugin.info.bss_size},
+        };
+
+        for (const auto& range : ranges) {
+            if (!range.size || range.offset > UINT64_MAX - plugin.base)
+                continue;
+            const uint64_t begin = plugin.base + range.offset;
+            if (range.size > UINT64_MAX - begin)
+                continue;
+            if (address >= begin && address - begin < range.size)
+                return &plugin;
+        }
+    }
+    return nullptr;
+}
+
 static bool skyline_module_contains(
     const ModuleInfo* module, uint64_t address) {
     if (!module)
@@ -355,7 +385,7 @@ static std::string skyline_module_address(uint64_t address) {
     uint64_t base = 0;
 
     if (SkylinePluginRuntime* plugin =
-            skyline_plugin_from_address(address, false)) {
+            skyline_plugin_containing_address(address)) {
         name = plugin->name.c_str();
         base = plugin->base;
     } else if (skyline_module_contains(g_main, address)) {
@@ -1491,8 +1521,194 @@ struct SkylineTraceProbe {
 static SkylineTraceProbe g_skyline_trace_probes[32]{};
 static uint32_t g_skyline_trace_probe_count = 0;
 
+struct BonusCallbackWatch {
+    bool active = false;
+    bool before_readable = false;
+    bool five_second_done = false;
+    bool title_screen_done = false;
+    uint64_t boot_id = 0;
+    uint64_t invocation = 0;
+    uint64_t address = 0;
+    uint64_t deadline_ns = 0;
+    uint8_t before[64]{};
+};
+
+static constexpr uint32_t kBonusCallbackWatchLimit = 20;
+static BonusCallbackWatch g_bonus_callback_watches[
+    kBonusCallbackWatchLimit]{};
+static uint32_t g_bonus_callback_watch_count = 0;
+static uint64_t g_bonus_callback_boot_id = 0;
+static std::mutex g_bonus_callback_watch_mutex;
+static bool g_bonus_callback_watch_started = false;
+
+static bool g_bonus_callback_sampling_complete = false;
+
+static uint64_t skyline_bonus_claim_sample() {
+    const std::string path =
+        plat::data_root() + "/bonus_callback_sample_count.txt";
+
+    uint64_t count = 0;
+    if (FILE* file = plat::fopen_utf8(path, "r")) {
+        unsigned long long stored = 0;
+        const int parsed = std::fscanf(file, "%llu", &stored);
+        std::fclose(file);
+
+        if (parsed != 1) {
+            log("plugin-trace bonus-counter invalid file=%s", path.c_str());
+            return 0;
+        }
+        count = static_cast<uint64_t>(stored);
+    }
+
+    if (count >= kBonusCallbackWatchLimit) {
+        log("plugin-trace bonus-counter complete count=%llu file=%s",
+            (unsigned long long)count, path.c_str());
+        return 0;
+    }
+
+    FILE* file = plat::fopen_utf8(path, "w");
+    if (!file) {
+        log("plugin-trace bonus-counter open-failed file=%s", path.c_str());
+        return 0;
+    }
+
+    const uint64_t next = count + 1;
+    const bool written =
+        std::fprintf(file, "%llu\n", (unsigned long long)next) > 0;
+    std::fclose(file);
+
+    if (!written) {
+        log("plugin-trace bonus-counter write-failed file=%s", path.c_str());
+        return 0;
+    }
+
+    log("plugin-trace bonus-counter ordinal=%llu file=%s",
+        (unsigned long long)next, path.c_str());
+    return next;
+}
+
+static void skyline_bonus_log_reread(
+    const BonusCallbackWatch& watch, const char* phase) {
+    uint8_t bytes[64]{};
+
+    if (!watch.address ||
+        !guest_range_ok(watch.address, sizeof(bytes), 1)) {
+        log("plugin-trace bonus-reread phase=%s boot=%llu invocation=%llu "
+            "address=0x%llx unreadable",
+            phase,
+            (unsigned long long)watch.boot_id,
+            (unsigned long long)watch.invocation,
+            (unsigned long long)watch.address);
+        return;
+    }
+
+    std::memcpy(bytes, reinterpret_cast<const void*>(watch.address),
+                sizeof(bytes));
+
+    char hex[sizeof(bytes) * 3]{};
+    size_t used = 0;
+    for (size_t i = 0; i < sizeof(bytes); ++i) {
+        const int n = std::snprintf(
+            hex + used, sizeof(hex) - used,
+            "%s%02x", i ? " " : "", unsigned(bytes[i]));
+        if (n <= 0 || static_cast<size_t>(n) >= sizeof(hex) - used)
+            break;
+        used += static_cast<size_t>(n);
+    }
+
+    const unsigned before_byte =
+        watch.before_readable ? unsigned(watch.before[20]) : 0;
+    const unsigned current_byte = unsigned(bytes[20]);
+    const char* byte_changed = !watch.before_readable ? "unknown" :
+        current_byte != before_byte ? "yes" : "no";
+    const char* region_changed = !watch.before_readable ? "unknown" :
+        std::memcmp(bytes, watch.before, sizeof(bytes)) ? "yes" : "no";
+
+    log("plugin-trace bonus-reread phase=%s boot=%llu invocation=%llu "
+        "address=0x%llx byte=0x%02x before_byte=%s%02x "
+        "byte_changed=%s region_changed=%s bytes=[%s]",
+        phase,
+        (unsigned long long)watch.boot_id,
+        (unsigned long long)watch.invocation,
+        (unsigned long long)watch.address,
+        current_byte,
+        watch.before_readable
+            ? "0x" : "unavailable/",
+        watch.before_readable ? before_byte : 0,
+        byte_changed, region_changed, hex);
+}
+
+static void skyline_bonus_callback_watch_thread(void*) {
+    plat::set_thread_name("bonus-watch");
+
+    for (;;) {
+        const uint64_t now = plat::monotonic_ns();
+        const bool title_active = game::title_screen_active();
+
+        uint32_t count = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_bonus_callback_watch_mutex);
+            count = g_bonus_callback_watch_count;
+        }
+
+        for (uint32_t i = 0; i < count; ++i) {
+            BonusCallbackWatch snapshot{};
+            bool read_five_seconds = false;
+            bool read_title_screen = false;
+
+            {
+                std::lock_guard<std::mutex> lock(
+                    g_bonus_callback_watch_mutex);
+
+                auto& watch = g_bonus_callback_watches[i];
+                if (!watch.active)
+                    continue;
+
+                if (!watch.five_second_done &&
+                    now >= watch.deadline_ns) {
+                    watch.five_second_done = true;
+                    read_five_seconds = true;
+                }
+
+                if (title_active && !watch.title_screen_done) {
+                    watch.title_screen_done = true;
+                    read_title_screen = true;
+                }
+
+                snapshot = watch;
+            }
+
+            if (read_five_seconds)
+                skyline_bonus_log_reread(snapshot, "5s");
+
+            if (read_title_screen)
+                skyline_bonus_log_reread(snapshot, "title-screen");
+        }
+
+        bool complete = false;
+        {
+            std::lock_guard<std::mutex> lock(g_bonus_callback_watch_mutex);
+            complete = g_bonus_callback_sampling_complete &&
+                       g_bonus_callback_watch_count != 0;
+
+            for (uint32_t i = 0; complete &&
+                 i < g_bonus_callback_watch_count; ++i) {
+                const auto& watch = g_bonus_callback_watches[i];
+                if (!watch.active || !watch.five_second_done ||
+                    !watch.title_screen_done)
+                    complete = false;
+            }
+        }
+
+        if (complete)
+            return;
+
+        plat::sleep_ns(100'000'000);
+    }
+}
+
 static void skyline_trace_probe_detail(
-    const SkylineTraceProbe& probe, const CPU& c) {
+    const SkylineTraceProbe& probe, const CPU& c, uint64_t hit) {
     const char* label = probe.label ? probe.label : "";
 
     const bool capture_stack =
@@ -1559,6 +1775,110 @@ static void skyline_trace_probe_detail(
             label, skyline_current_tid(), (unsigned long long)c.x[19],
             fields[0], fields[1], fields[2],
             fields[3], fields[4], fields[5]);
+    }
+
+    if (std::strcmp(label, "callback-config-write") == 0 &&
+        hit <= kBonusCallbackWatchLimit) {
+        BonusCallbackWatch watch{};
+        const uint64_t now = plat::monotonic_ns();
+
+        const bool address_valid =
+            c.x[21] <= UINT64_MAX - 212;
+        watch.address = address_valid ? c.x[21] + 192 : 0;
+        watch.deadline_ns =
+            now <= UINT64_MAX - 5'000'000'000ull
+                ? now + 5'000'000'000ull : UINT64_MAX;
+
+        if (watch.address &&
+            guest_range_ok(watch.address, sizeof(watch.before), 1)) {
+            std::memcpy(watch.before,
+                reinterpret_cast<const void*>(watch.address),
+                sizeof(watch.before));
+            watch.before_readable = true;
+        }
+
+        bool start_monitor = false;
+        uint64_t ordinal = 0;
+        {
+            std::lock_guard<std::mutex> lock(
+                g_bonus_callback_watch_mutex);
+
+            ordinal = skyline_bonus_claim_sample();
+            if (ordinal) {
+                watch.active = true;
+                watch.invocation = ordinal;
+
+                if (!g_bonus_callback_boot_id)
+                    g_bonus_callback_boot_id = now;
+                watch.boot_id = g_bonus_callback_boot_id;
+
+                const uint32_t slot = g_bonus_callback_watch_count;
+                if (slot < kBonusCallbackWatchLimit) {
+                    g_bonus_callback_watches[slot] = watch;
+                    ++g_bonus_callback_watch_count;
+                }
+
+                if (ordinal == kBonusCallbackWatchLimit)
+                    g_bonus_callback_sampling_complete = true;
+
+                if (!g_bonus_callback_watch_started) {
+                    g_bonus_callback_watch_started = true;
+                    start_monitor = true;
+                }
+            }
+        }
+
+        if (start_monitor)
+            plat::start_thread(
+                skyline_bonus_callback_watch_thread, nullptr, 1ull << 20);
+
+        if (ordinal) {
+            const std::string x21_owner =
+                skyline_module_address(c.x[21]);
+
+            char before_hex[sizeof(watch.before) * 3]{};
+            size_t before_used = 0;
+            if (watch.before_readable) {
+                for (size_t i = 0; i < sizeof(watch.before); ++i) {
+                    const int n = std::snprintf(
+                        before_hex + before_used,
+                        sizeof(before_hex) - before_used,
+                        "%s%02x", i ? " " : "",
+                        unsigned(watch.before[i]));
+                    if (n <= 0 ||
+                        static_cast<size_t>(n) >=
+                            sizeof(before_hex) - before_used)
+                        break;
+                    before_used += static_cast<size_t>(n);
+                }
+            } else {
+                std::snprintf(before_hex, sizeof(before_hex),
+                              "unavailable");
+            }
+
+            log("plugin-trace bonus-sample boot=%llu invocation=%llu "
+                "process_hit=%llu x21=0x%016llx x21_owner=%s region=0x%llx "
+                "store_address=0x%llx x22=0x%016llx "
+                "add_left_x9=0x%016llx add_shifted_x9=0x%016llx "
+                "operation=add-x9-x9-shift-1 stored_byte=0x%02x "
+                "prior_byte=%s%02x before_bytes=[%s]",
+                (unsigned long long)watch.boot_id,
+                (unsigned long long)ordinal,
+                (unsigned long long)hit,
+                (unsigned long long)c.x[21],
+                x21_owner.c_str(),
+                (unsigned long long)watch.address,
+                (unsigned long long)(
+                    address_valid ? c.x[21] + 212 : 0),
+                (unsigned long long)c.x[22],
+                (unsigned long long)c.x[9],
+                (unsigned long long)c.x[9],
+                unsigned(c.x[8] & 0xff),
+                watch.before_readable ? "0x" : "unavailable/",
+                watch.before_readable
+                    ? unsigned(watch.before[20]) : 0,
+                before_hex);
+        }
     }
 
     const bool capture_callback_state =
@@ -1631,7 +1951,10 @@ static void skyline_trace_probe(CPU& c) {
         const uint64_t hit = __atomic_add_fetch(
             &probe.hits, uint64_t(1), __ATOMIC_RELAXED);
 
-        if (hit <= 8) {
+        const bool keep_twenty =
+            std::strcmp(probe.label, "callback-config-write") == 0 ||
+            std::strcmp(probe.label, "callback-config-after") == 0;
+        if (hit <= (keep_twenty ? 20ull : 8ull)) {
             uint64_t caller_lr = 0;
             if (c.x[31])
                 std::memcpy(&caller_lr,
@@ -1664,7 +1987,7 @@ static void skyline_trace_probe(CPU& c) {
                 (unsigned long long)c.x[21],
                 (unsigned long long)c.x[22]);
 
-            skyline_trace_probe_detail(probe, c);
+            skyline_trace_probe_detail(probe, c, hit);
         }
         return;
     }
