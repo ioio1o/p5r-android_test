@@ -53,6 +53,7 @@ uint64_t counting_veneer(uint64_t module_base, uint64_t slot,
 // Installs an inline hook for a single displaced AArch64 BL instruction.
 uint64_t hook_inline(uint64_t addr, HleFn fn);
 uint64_t hook_inline_instruction(uint64_t addr, HleFn fn);
+uint64_t hook_inline_instruction(const LoadedModule& module, uint64_t addr, HleFn fn);
 
 // Emit a point-in-time function-hook and pointer-veneer hit table.
 void log_hook_stats(const char* owner);

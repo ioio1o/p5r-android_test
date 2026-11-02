@@ -11,6 +11,11 @@
 #include <string>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #include <nx/game.h>
 #include <nx/runtime.h>
 
@@ -1467,6 +1472,128 @@ struct SkylineGenericInlineHook {
 static SkylineGenericInlineHook g_skyline_generic_inline_hooks[64]{};
 static uint32_t g_skyline_generic_inline_hook_count = 0;
 
+static long skyline_current_tid() {
+#if defined(__linux__)
+    return static_cast<long>(::syscall(SYS_gettid));
+#else
+    return 0;
+#endif
+}
+
+struct SkylineTraceProbe {
+    uint64_t target = 0;
+    uint64_t module_base = 0;
+    uint64_t continuation = 0;
+    const char* label = nullptr;
+    uint64_t hits = 0;
+};
+
+static SkylineTraceProbe g_skyline_trace_probes[16]{};
+static uint32_t g_skyline_trace_probe_count = 0;
+
+static void skyline_trace_probe(CPU& c) {
+    const uint64_t continuation = c.x[30];
+
+    for (uint32_t i = 0; i < g_skyline_trace_probe_count; ++i) {
+        auto& probe = g_skyline_trace_probes[i];
+        if (probe.continuation != continuation)
+            continue;
+
+        const uint64_t hit = __atomic_add_fetch(
+            &probe.hits, uint64_t(1), __ATOMIC_RELAXED);
+
+        if (hit <= 8) {
+            uint64_t caller_lr = 0;
+            if (c.x[31])
+                std::memcpy(&caller_lr,
+                    reinterpret_cast<const void*>(c.x[31]),
+                    sizeof(caller_lr));
+
+            log("plugin-trace probe label=%s target=0x%llx "
+                "offset=0x%llx hit=%llu tid=%ld "
+                "scope=%s scope_target=0x%llx scope_invocation=%llu "
+                "caller_lr=0x%llx x0=0x%llx x1=0x%llx "
+                "x8=0x%llx x19=0x%llx x20=0x%llx "
+                "x21=0x%llx x22=0x%llx",
+                probe.label,
+                (unsigned long long)probe.target,
+                (unsigned long long)(probe.target - probe.module_base),
+                (unsigned long long)hit,
+                skyline_current_tid(),
+                plugin_trace_active() ? plugin_trace_hook() : "none",
+                (unsigned long long)plugin_trace_target(),
+                (unsigned long long)plugin_trace_invocation(),
+                (unsigned long long)caller_lr,
+                (unsigned long long)c.x[0],
+                (unsigned long long)c.x[1],
+                (unsigned long long)c.x[8],
+                (unsigned long long)c.x[19],
+                (unsigned long long)c.x[20],
+                (unsigned long long)c.x[21],
+                (unsigned long long)c.x[22]);
+        }
+        return;
+    }
+}
+
+static void skyline_install_bonus_trace_probes(
+    const LoadedModule& module, const std::string& plugin_name) {
+    if (plugin_name != "libp5r_bdsm.nro")
+        return;
+
+    struct ProbeSpec {
+        uint64_t offset;
+        const char* label;
+    };
+
+    static constexpr ProbeSpec probes[] = {
+        {0x0db58, "callback-entry"},
+        {0x0dc10, "callback-after-helper-B"},
+        {0x0dc2c, "callback-after-helper-A"},
+        {0x0dc40, "callback-loop-block"},
+        {0x18264, "helper-18264"},
+        {0x165b0, "helper-B"},
+        {0x16530, "helper-A"},
+        {0x1598c, "transform-1598c"},
+        {0x3caa0, "helper-3caa0"},
+        {0x05420, "helper-5420"},
+    };
+
+    for (const auto& spec : probes) {
+        if (g_skyline_trace_probe_count >=
+            sizeof(g_skyline_trace_probes) /
+                sizeof(g_skyline_trace_probes[0])) {
+            log("plugin-trace probe-install capacity exceeded");
+            return;
+        }
+
+        // Probe offsets are NRO load-base-relative, not text-relative.
+        const uint64_t target = module.base + spec.offset;
+        const uint64_t continuation =
+            nce::hook_inline_instruction(
+                module, target, skyline_trace_probe);
+
+        if (!continuation) {
+            log("plugin-trace probe-install label=%s target=0x%llx failed",
+                spec.label, (unsigned long long)target);
+            continue;
+        }
+
+        auto& probe =
+            g_skyline_trace_probes[g_skyline_trace_probe_count++];
+        probe.target = target;
+        probe.module_base = module.base;
+        probe.continuation = continuation;
+        probe.label = spec.label;
+
+        log("plugin-trace probe-install label=%s target=0x%llx "
+            "continuation=0x%llx",
+            spec.label,
+            (unsigned long long)target,
+            (unsigned long long)continuation);
+    }
+}
+
 static void skyline_generic_inline_hook_callback(CPU& c) {
     const uint64_t continuation = c.x[30];
     const uint64_t saved_stack_sp = c.x[31];
@@ -1565,11 +1692,13 @@ static void skyline_generic_inline_hook_callback(CPU& c) {
 
     if (trace_bonus_callback)
         log("plugin-trace callback-enter name=%s target=0x%llx "
-            "invocation=%llu replacement=%s w8=0x%08x x8=0x%016llx "
+            "invocation=%llu tid=%ld replacement=%s "
+            "w8=0x%08x x8=0x%016llx "
             "x19=0x%016llx x0=0x%016llx x1=0x%016llx",
             callback_plugin->name.c_str(),
             (unsigned long long)hook->target,
             (unsigned long long)invocation,
+            skyline_current_tid(),
             skyline_plugin_address_label(replacement).c_str(),
             unsigned(context->x[8] & 0xffffffffu),
             (unsigned long long)context->x[8],
@@ -1617,11 +1746,12 @@ static void skyline_generic_inline_hook_callback(CPU& c) {
 
     if (trace_bonus_callback)
         log("plugin-trace callback-exit name=%s target=0x%llx "
-            "invocation=%llu w8=0x%08x x8=0x%016llx "
+            "invocation=%llu tid=%ld w8=0x%08x x8=0x%016llx "
             "x19=0x%016llx x0=0x%016llx x1=0x%016llx",
             callback_plugin->name.c_str(),
             (unsigned long long)hook->target,
             (unsigned long long)invocation,
+            skyline_current_tid(),
             unsigned(context->x[8] & 0xffffffffu),
             (unsigned long long)context->x[8],
             (unsigned long long)context->x[19],
@@ -2375,6 +2505,8 @@ static bool load_skyline_nro(const std::filesystem::path& path) {
         plugin->symbols.size(),
         plugin->relocs.size());
 
+    skyline_install_bonus_trace_probes(loaded, plugin_name);
+
     g_skyline_plugins.push_back(std::move(plugin));
     return true;
 }
@@ -2665,12 +2797,13 @@ static void skyline_trace_generate_random_bytes(CPU& c) {
         g_main &&
         plugin_trace_target() == g_main->base + 0xcc2d1c;
 
-    log("skyline: random-bytes invocation=%llu "
+    log("skyline: random-bytes invocation=%llu tid=%ld "
         "caller=0x%016llx (%s) destination=0x%016llx "
         "size=%llu x0_after=0x%llx output_size=%zu output=[%s] "
         "callback=%s callback_invocation=%llu callback_target=0x%llx "
         "plugin_trace=%s plugin_target=0x%llx",
         (unsigned long long)invocation,
+        skyline_current_tid(),
         (unsigned long long)caller,
         caller_description.c_str(),
         (unsigned long long)destination,

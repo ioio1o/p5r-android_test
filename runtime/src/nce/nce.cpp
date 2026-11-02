@@ -1261,10 +1261,12 @@ if (!protect(r.base, kRegionSize, PROT_READ | PROT_WRITE | PROT_EXEC))
     return continuation;
 }
 
-uint64_t hook_inline_instruction(uint64_t addr, HleFn fn) {
+static uint64_t hook_inline_instruction_for_module(
+    const LoadedModule* explicit_module, uint64_t addr, HleFn fn) {
     std::lock_guard lk(g_regions_lock);
 
-    const LoadedModule* m = module_at(addr);
+    const LoadedModule* m =
+        explicit_module ? explicit_module : module_at(addr);
     auto it = m ? g_regions.find(m->base) : g_regions.end();
 
     if (!fn || it == g_regions.end() ||
@@ -1392,6 +1394,15 @@ uint64_t hook_inline_instruction(uint64_t addr, HleFn fn) {
         (unsigned long long)continuation);
 
     return continuation;
+}
+
+uint64_t hook_inline_instruction(uint64_t addr, HleFn fn) {
+    return hook_inline_instruction_for_module(nullptr, addr, fn);
+}
+
+uint64_t hook_inline_instruction(
+    const LoadedModule& module, uint64_t addr, HleFn fn) {
+    return hook_inline_instruction_for_module(&module, addr, fn);
 }
 
 void log_hook_stats(const char* owner) {
