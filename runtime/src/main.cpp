@@ -2527,16 +2527,12 @@ static void skyline_trace_generate_random_bytes(CPU& c) {
         __atomic_add_fetch(&g_random_bytes_calls, uint64_t(1),
                            __ATOMIC_RELAXED);
 
-    const std::string caller_description = describe(caller);
+    const std::string caller_description =
+        skyline_module_address(caller >= 4 ? caller - 4 : caller);
 
     // Execute the real SDK function through its NCE trampoline.
     call(c, g_random_bytes_original);
-
-    if (invocation > 64) {
-        if (invocation == 65)
-            log("skyline: random-bytes further calls suppressed");
-        return;
-    }
+    const uint64_t x0_after = c.x[0];
 
     uint8_t bytes[16]{};
     const size_t count = static_cast<size_t>(
@@ -2568,13 +2564,14 @@ static void skyline_trace_generate_random_bytes(CPU& c) {
 
     log("skyline: random-bytes invocation=%llu "
         "caller=0x%016llx (%s) destination=0x%016llx "
-        "size=%llu output_size=%zu output=[%s] "
+        "size=%llu x0_after=0x%llx output_size=%zu output=[%s] "
         "plugin_trace=%s plugin_target=0x%llx",
         (unsigned long long)invocation,
         (unsigned long long)caller,
         caller_description.c_str(),
         (unsigned long long)destination,
         (unsigned long long)requested_size,
+        (unsigned long long)x0_after,
         count, output_readable ? hex : "<unreadable>",
         plugin_trace_active() ? plugin_trace_hook() : "none",
         (unsigned long long)plugin_trace_target());

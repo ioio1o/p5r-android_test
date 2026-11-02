@@ -52,7 +52,14 @@ uint32_t Service::handle(IpcCtx& ctx) {
         log("ipc: %s cmd %u not implemented (stub ok)", name.c_str(), ctx.cmd);
     }
 
-    if (plugin_trace_active()) {
+    const bool trace_random_or_time_service =
+        name == "csrng" ||
+        name.rfind("time:", 0) == 0 ||
+        name == "ISystemClock" ||
+        name == "ISteadyClock" ||
+        name == "ITimeZoneService";
+
+    if (plugin_trace_active() || trace_random_or_time_service) {
         auto hex = [](const uint8_t* data, size_t size, char* out, size_t capacity) {
             size_t used = 0;
             const size_t count = std::min<size_t>(size, 32);
@@ -73,12 +80,12 @@ uint32_t Service::handle(IpcCtx& ctx) {
         if (!ctx.out.empty())
             hex(ctx.out.data(), ctx.out.size(), output_hex, sizeof(output_hex));
 
-        log("plugin-trace ipc hook=%s target=0x%llx invocation=%llu "
+        log("ipc-trace hook=%s target=0x%llx invocation=%llu "
             "service=%s cmd=%u result=0x%08x "
             "input_size=%zu input=[%s] output_size=%zu output=[%s]",
-            plugin_trace_hook(),
-            (unsigned long long)plugin_trace_target(),
-            (unsigned long long)plugin_trace_invocation(),
+            plugin_trace_active() ? plugin_trace_hook() : "none",
+            (unsigned long long)(plugin_trace_active() ? plugin_trace_target() : 0),
+            (unsigned long long)(plugin_trace_active() ? plugin_trace_invocation() : 0),
             name.c_str(), ctx.cmd, rc,
             ctx.in_size, input_hex, ctx.out.size(), output_hex);
     }
