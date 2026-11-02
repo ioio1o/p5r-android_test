@@ -1488,8 +1488,94 @@ struct SkylineTraceProbe {
     uint64_t hits = 0;
 };
 
-static SkylineTraceProbe g_skyline_trace_probes[16]{};
+static SkylineTraceProbe g_skyline_trace_probes[32]{};
 static uint32_t g_skyline_trace_probe_count = 0;
+
+static void skyline_trace_probe_detail(
+    const SkylineTraceProbe& probe, const CPU& c) {
+    const char* label = probe.label ? probe.label : "";
+
+    const bool capture_stack =
+        std::strcmp(label, "helper-B-rng-pre") == 0 ||
+        std::strcmp(label, "helper-B-rng-post") == 0;
+
+    const uint64_t stack_address =
+        c.x[31] <= UINT64_MAX - 16 ? c.x[31] + 16 : 0;
+
+    if (capture_stack && stack_address) {
+        uint8_t bytes[32]{};
+        std::memcpy(bytes, reinterpret_cast<const void*>(stack_address),
+                    sizeof(bytes));
+
+        char hex[sizeof(bytes) * 3]{};
+        size_t used = 0;
+        for (size_t i = 0; i < sizeof(bytes); ++i) {
+            const int n = std::snprintf(
+                hex + used, sizeof(hex) - used,
+                "%s%02x", i ? " " : "", bytes[i]);
+            if (n <= 0)
+                break;
+            used += static_cast<size_t>(n);
+        }
+
+        log("plugin-trace stack label=%s tid=%ld sp=0x%llx bytes=[%s]",
+            label, skyline_current_tid(),
+            (unsigned long long)stack_address, hex);
+    }
+
+    const bool capture_object =
+        std::strcmp(label, "callback-loop-block") == 0 ||
+        std::strcmp(label, "callback-state-write") == 0 ||
+        std::strcmp(label, "callback-state-after") == 0 ||
+        std::strcmp(label, "callback-after-helper-3caa0") == 0 ||
+        std::strcmp(label, "callback-config-write") == 0 ||
+        std::strcmp(label, "callback-config-after") == 0;
+
+    if (capture_object && c.x[19]) {
+        static constexpr uint64_t offsets[] = {
+            0, 8, 272, 280, 336, 344
+        };
+        char fields[sizeof(offsets) / sizeof(offsets[0])][32]{};
+
+        for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
+            uint64_t value = 0;
+            const uint64_t address =
+                c.x[19] <= UINT64_MAX - offsets[i]
+                    ? c.x[19] + offsets[i] : 0;
+
+            if (address && guest_range_ok(address, sizeof(value), 1)) {
+                std::memcpy(&value,
+                    reinterpret_cast<const void*>(address), sizeof(value));
+                std::snprintf(fields[i], sizeof(fields[i]),
+                    "0x%016llx", (unsigned long long)value);
+            } else {
+                std::snprintf(fields[i], sizeof(fields[i]), "<unreadable>");
+            }
+        }
+
+        log("plugin-trace object label=%s tid=%ld x19=0x%llx "
+            "fields=[+0x0=%s,+0x8=%s,+0x110=%s,+0x118=%s,"
+            "+0x150=%s,+0x158=%s]",
+            label, skyline_current_tid(), (unsigned long long)c.x[19],
+            fields[0], fields[1], fields[2],
+            fields[3], fields[4], fields[5]);
+    }
+
+    if (std::strcmp(label, "callback-config-write") == 0 ||
+        std::strcmp(label, "callback-config-after") == 0) {
+        uint8_t value = 0;
+        const uint64_t address =
+            c.x[21] <= UINT64_MAX - 212 ? c.x[21] + 212 : 0;
+        if (address && guest_range_ok(address, sizeof(value), 1)) {
+            std::memcpy(&value, reinterpret_cast<const void*>(address),
+                        sizeof(value));
+            log("plugin-trace config label=%s x21=0x%llx "
+                "address=0x%llx value=0x%02x",
+                label, (unsigned long long)c.x[21],
+                (unsigned long long)address, unsigned(value));
+        }
+    }
+}
 
 static void skyline_trace_probe(CPU& c) {
     const uint64_t continuation = c.x[30];
@@ -1531,6 +1617,8 @@ static void skyline_trace_probe(CPU& c) {
                 (unsigned long long)c.x[20],
                 (unsigned long long)c.x[21],
                 (unsigned long long)c.x[22]);
+
+            skyline_trace_probe_detail(probe, c);
         }
         return;
     }
@@ -1551,8 +1639,18 @@ static void skyline_install_bonus_trace_probes(
         {0x0dc10, "callback-after-helper-B"},
         {0x0dc2c, "callback-after-helper-A"},
         {0x0dc40, "callback-loop-block"},
+        {0x0dc74, "callback-state-write"},
+        {0x0dc7c, "callback-state-after"},
+        {0x0dca8, "callback-after-helper-3caa0"},
+        {0x0dcac, "callback-config-write"},
+        {0x0dcb0, "callback-config-after"},
         {0x18264, "helper-18264"},
         {0x165b0, "helper-B"},
+        {0x165e0, "helper-B-after-tls-1"},
+        {0x165fc, "helper-B-after-init"},
+        {0x16604, "helper-B-after-tls-2"},
+        {0x16624, "helper-B-rng-pre"},
+        {0x16628, "helper-B-rng-post"},
         {0x16530, "helper-A"},
         {0x1598c, "transform-1598c"},
         {0x3caa0, "helper-3caa0"},
