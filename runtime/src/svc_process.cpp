@@ -1,8 +1,16 @@
 // Process-level SVCs and state that do not touch the scheduler: svcGetInfo, thread core masks, transfer memory
 // mappings, and the initial static TLS every thread starts with. kernel.cpp dispatches to these.
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
+#include <random>
 #include <vector>
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #include <nx/game.h>
 #include <nx/runtime.h>
@@ -10,6 +18,65 @@
 #include "kernel.h"
 
 namespace nx {
+
+namespace {
+uint64_t g_random_entropy[4]{};
+bool g_random_entropy_initialized = false;
+}
+
+void init_random_entropy() {
+    if (g_random_entropy_initialized)
+        return;
+
+    uint8_t bytes[sizeof(g_random_entropy)]{};
+
+#if defined(__linux__)
+    size_t filled = 0;
+    bool getrandom_ok = true;
+    while (filled < sizeof(bytes)) {
+        const long result = ::syscall(
+            SYS_getrandom, bytes + filled, sizeof(bytes) - filled, 0);
+        if (result < 0 && errno == EINTR)
+            continue;
+        if (result <= 0) {
+            getrandom_ok = false;
+            break;
+        }
+        filled += static_cast<size_t>(result);
+    }
+
+    if (getrandom_ok) {
+        log("entropy source=getrandom ok");
+    } else {
+        const int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            fatal("entropy: getrandom failed and /dev/urandom could not be opened");
+
+        filled = 0;
+        while (filled < sizeof(bytes)) {
+            const ssize_t result =
+                ::read(fd, bytes + filled, sizeof(bytes) - filled);
+            if (result < 0 && errno == EINTR)
+                continue;
+            if (result <= 0) {
+                ::close(fd);
+                fatal("entropy: /dev/urandom read failed");
+            }
+            filled += static_cast<size_t>(result);
+        }
+        ::close(fd);
+        log("entropy source=/dev/urandom ok");
+    }
+#else
+    std::random_device source;
+    for (size_t i = 0; i < sizeof(bytes); ++i)
+        bytes[i] = static_cast<uint8_t>(source());
+    log("entropy source=random_device ok");
+#endif
+
+    std::memcpy(g_random_entropy, bytes, sizeof(g_random_entropy));
+    g_random_entropy_initialized = true;
+}
 
 // ---- svcGetInfo -------------------------------------------------------------------------------------------------
 
@@ -28,7 +95,10 @@ uint64_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint32_t& rc) {
         case 8: return 0;  // IsCurrentProcessBeingDebugged
         case 9: return 0;  // ResourceLimit handle
         case 10: return 0;  // IdleTickCount
-        case 11: return 0x1234567890ABCDEFull ^ sub;  // RandomEntropy
+        case 11:
+            return sub < 4
+                ? g_random_entropy[sub]
+                : (0x1234567890ABCDEFull ^ sub);  // RandomEntropy
         case 12: return kAddressSpaceBase;
         case 13: return kAddressSpaceSize;
         case 14: return kStackBase;

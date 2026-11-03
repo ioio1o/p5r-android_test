@@ -3494,6 +3494,7 @@ static void run_skyline_plugins(CPU& c) {
 
 static uint64_t g_random_bytes_original = 0;
 static uint64_t g_random_bytes_calls = 0;
+static bool g_bonus_random_bytes_logged = false;
 
 static void skyline_trace_generate_random_bytes(CPU& c) {
     const uint64_t destination = c.x[0];
@@ -3537,6 +3538,20 @@ static void skyline_trace_generate_random_bytes(CPU& c) {
             break;
 
         used += static_cast<size_t>(n);
+    }
+
+    const SkylinePluginRuntime* caller_plugin =
+        skyline_plugin_from_address(caller, true);
+    if (!g_bonus_random_bytes_logged && caller_plugin &&
+        caller_plugin->name == "libp5r_bdsm.nro" &&
+        count >= 16 && output_readable) {
+        char first16[16 * 2 + 1]{};
+        for (size_t i = 0; i < 16; ++i)
+            std::snprintf(first16 + i * 2, sizeof(first16) - i * 2,
+                          "%02x", bytes[i]);
+        log("skyline: libp5r_bdsm.nro GenerateRandomBytes first16=%s",
+            first16);
+        g_bonus_random_bytes_logged = true;
     }
 
     const bool inside_bonus_callback =
@@ -3664,6 +3679,7 @@ void boot() {
     if (plat::setting("trace") == "1") g_trace = true;
     memory_init();
     kernel_init();
+    init_random_entropy();
 #if NX_NCE
     // P5R 1.0.2 test: only execute modules from the explicitly selected game image.
     // Never fall back to a separately extracted ExeFS directory.
