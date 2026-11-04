@@ -331,20 +331,55 @@ const nxi::GameImage::Entry kModDir{0, 0, true};
 
 void scan_mods() {
     g_mod_roots.clear();
-    std::error_code ec;
-    fs::path root = data_root() / "mods";
-    if (!fs::is_directory(root, ec)) return;
     std::vector<fs::path> found;
-    for (auto& e : fs::directory_iterator(root, ec)) {
-        if (!e.is_directory(ec)) continue;
-        auto u8 = e.path().filename().u8string();
-        std::string name(u8.begin(), u8.end());
-        if (name.empty() || name[0] == '.' || name[0] == '_') continue;
-        if (fs::is_directory(e.path() / "romfs", ec)) found.push_back(e.path() / "romfs");
+
+    // Preserve the existing per-mod layout and alphabetical precedence.
+    const fs::path mods_root = data_root() / "mods";
+    std::error_code mods_ec;
+    if (fs::is_directory(mods_root, mods_ec) && !mods_ec) {
+        for (fs::directory_iterator it(mods_root, mods_ec), end;
+             !mods_ec && it != end; it.increment(mods_ec)) {
+            std::error_code entry_ec;
+            if (!it->is_directory(entry_ec) || entry_ec)
+                continue;
+            const auto u8 = it->path().filename().u8string();
+            const std::string name(u8.begin(), u8.end());
+            if (name.empty() || name[0] == '.' || name[0] == '_')
+                continue;
+            const fs::path romfs = it->path() / "romfs";
+            std::error_code romfs_ec;
+            if (fs::is_directory(romfs, romfs_ec) && !romfs_ec)
+                found.push_back(romfs);
+        }
     }
     std::sort(found.begin(), found.end());
+
+    // Atmosphere's title-specific RomFS is the highest-priority overlay.
+    bool atmosphere_added = false;
+    if (const nxi::GameImage* image = game_image()) {
+        char title_id[17]{};
+        std::snprintf(title_id, sizeof(title_id), "%016llX",
+            static_cast<unsigned long long>(image->title_id()));
+        const fs::path atmosphere_romfs =
+            data_root() / "sdmc" / "atmosphere" / "contents" /
+            title_id / "romfs";
+        std::error_code atmosphere_ec;
+        if (fs::is_directory(atmosphere_romfs, atmosphere_ec) &&
+            !atmosphere_ec) {
+            found.push_back(atmosphere_romfs);
+            atmosphere_added = true;
+            log("fs: Atmosphere title RomFS active: %s",
+                atmosphere_romfs.string().c_str());
+        }
+    }
+
     g_mod_roots = std::move(found);
-    for (auto& r : g_mod_roots) log("fs: mod active: %s", r.parent_path().filename().string().c_str());
+    for (size_t i = 0; i < g_mod_roots.size(); ++i) {
+        if (atmosphere_added && i + 1 == g_mod_roots.size())
+            continue;
+        log("fs: mod active: %s",
+            g_mod_roots[i].parent_path().filename().string().c_str());
+    }
 }
 
 bool safe_rel(const std::string& rel) {  // no ".." part: a mod path never leaves its folder

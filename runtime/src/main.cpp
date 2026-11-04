@@ -3739,9 +3739,47 @@ void boot() {
 
     // Read-only Skyline plugin import inspection. Plugins are not loaded or executed.
     namespace fs = std::filesystem;
-    const fs::path mods_root = fs::u8path(plat::data_root()) / "mods";
+    const fs::path data_root = fs::u8path(plat::data_root());
+    const fs::path mods_root = data_root / "mods";
     std::vector<fs::path> plugin_paths;
     std::error_code ec;
+
+    // The legacy mod layout remains supported during migration.
+    // Atmosphere title-RomFS plugins take precedence over a legacy plugin
+    // with the same filename, matching the title overlay's higher priority.
+    auto collect_plugin_files = [&](const fs::path& plugins_dir,
+                                    bool atmosphere_override) {
+        std::error_code plugins_ec;
+        if (!fs::is_directory(plugins_dir, plugins_ec) || plugins_ec)
+            return;
+
+        log("skyline: plugin directory: %s (%s)",
+            plugins_dir.string().c_str(),
+            atmosphere_override ? "Atmosphere title RomFS" : "legacy mod");
+
+        for (fs::directory_iterator plugin_it(plugins_dir, plugins_ec), plugin_end;
+             !plugins_ec && plugin_it != plugin_end;
+             plugin_it.increment(plugins_ec)) {
+            std::error_code file_ec;
+            if (!plugin_it->is_regular_file(file_ec) || file_ec)
+                continue;
+
+            const fs::path plugin_path = plugin_it->path();
+            if (plugin_path.extension() != ".nro")
+                continue;
+
+            if (atmosphere_override) {
+                const std::string filename = plugin_path.filename().string();
+                plugin_paths.erase(
+                    std::remove_if(plugin_paths.begin(), plugin_paths.end(),
+                        [&](const fs::path& existing) {
+                            return existing.filename().string() == filename;
+                        }),
+                    plugin_paths.end());
+            }
+            plugin_paths.push_back(plugin_path);
+        }
+    };
 
     if (fs::is_directory(mods_root, ec) && !ec) {
         for (fs::directory_iterator it(mods_root, ec), finish;
@@ -3754,24 +3792,18 @@ void boot() {
             if (folder.empty() || folder[0] == '.' || folder[0] == '_')
                 continue;
 
-            const fs::path plugins_dir =
-                it->path() / "romfs" / "skyline" / "plugins";
-            std::error_code plugins_ec;
-            if (!fs::is_directory(plugins_dir, plugins_ec) || plugins_ec)
-                continue;
-
-            for (fs::directory_iterator plugin_it(plugins_dir, plugins_ec), plugin_end;
-                 !plugins_ec && plugin_it != plugin_end;
-                 plugin_it.increment(plugins_ec)) {
-                std::error_code file_ec;
-                if (!plugin_it->is_regular_file(file_ec) || file_ec)
-                    continue;
-
-                if (plugin_it->path().extension() == ".nro")
-                    plugin_paths.push_back(plugin_it->path());
-            }
+            collect_plugin_files(
+                it->path() / "romfs" / "skyline" / "plugins", false);
         }
     }
+
+    char title_id[17]{};
+    std::snprintf(title_id, sizeof(title_id), "%016llX",
+        static_cast<unsigned long long>(image->title_id()));
+    collect_plugin_files(
+        data_root / "sdmc" / "atmosphere" / "contents" /
+            title_id / "romfs" / "skyline" / "plugins",
+        true);
 
     std::sort(plugin_paths.begin(), plugin_paths.end());
     log("skyline: discovered %zu plugin NRO file(s)", plugin_paths.size());
