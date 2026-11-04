@@ -1,6 +1,7 @@
 // Process-level SVCs and state that do not touch the scheduler: svcGetInfo, thread core masks, transfer memory
 // mappings, and the initial static TLS every thread starts with. kernel.cpp dispatches to these.
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -50,7 +51,8 @@ uint64_t splitmix64(uint64_t& state) {
 }
 
 void clock_address_entropy(uint8_t* bytes, size_t size) {
-    uint64_t stack_address = reinterpret_cast<uintptr_t>(&stack_address);
+    uint64_t stack_marker = 0;
+    const uint64_t stack_address = reinterpret_cast<uintptr_t>(&stack_marker);
     uint64_t buffer_address = reinterpret_cast<uintptr_t>(bytes);
     uint64_t state =
         static_cast<uint64_t>(
@@ -132,6 +134,11 @@ bool acquire_entropy(uint8_t* bytes, size_t size, EntropySource& source) {
     }
 #endif
 
+    static std::atomic_flag fallback_warning = ATOMIC_FLAG_INIT;
+    if (!fallback_warning.test_and_set(std::memory_order_relaxed)) {
+        log("WARNING: entropy: secure entropy sources unavailable; "
+            "using clock+address fallback");
+    }
     clock_address_entropy(bytes, size);
     source = EntropySource::ClockAddressMix;
     return true;
@@ -183,7 +190,9 @@ void init_random_entropy() {
 
     log("entropy source=%s", entropy_source_name(source));
     log("entropy-hash=%08x",
-        static_cast<unsigned>(entropy_hash(bytes, sizeof(bytes))));
+        static_cast<unsigned>(entropy_hash(
+        reinterpret_cast<const uint8_t*>(g_random_entropy),
+        sizeof(g_random_entropy))));
     g_random_entropy_initialized = true;
 }
 

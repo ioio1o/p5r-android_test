@@ -77,8 +77,11 @@ uint32_t Service::handle(IpcCtx& ctx) {
         char output_hex[128]{};
         if (ctx.in && ctx.in_size)
             hex(ctx.in, ctx.in_size, input_hex, sizeof(input_hex));
-        if (!ctx.out.empty())
+        if (name == "csrng" && !ctx.out.empty()) {
+            std::snprintf(output_hex, sizeof(output_hex), "<redacted>");
+        } else if (!ctx.out.empty()) {
             hex(ctx.out.data(), ctx.out.size(), output_hex, sizeof(output_hex));
+        }
 
         log("ipc-trace hook=%s target=0x%llx invocation=%llu "
             "service=%s cmd=%u result=0x%08x "

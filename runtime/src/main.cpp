@@ -10,6 +10,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #if defined(__linux__)
@@ -3680,6 +3681,16 @@ void boot() {
     memory_init();
     kernel_init();
     init_random_entropy();
+
+    const auto debug_dir = std::filesystem::u8path(plat::data_root()) / "p5r";
+    for (const char* filename : {
+             "skyline_inline_override.txt", "skyline_poke.txt"}) {
+        const auto path = debug_dir / filename;
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec) && !ec)
+            log("WARNING: skyline debug file active: %s", path.string().c_str());
+    }
+
 #if NX_NCE
     // P5R 1.0.2 test: only execute modules from the explicitly selected game image.
     // Never fall back to a separately extracted ExeFS directory.
