@@ -165,10 +165,41 @@ enum class SkylineHookMode {
 static SkylineHookMode g_skyline_hook_mode =
     SkylineHookMode::Passthrough;
 static bool g_skyline_hook_mode_loaded = false;
+static bool g_skyline_plugin_trace_enabled = false;
+static bool g_skyline_per_hit_logs_enabled = false;
+
+static void skyline_load_debug_settings() {
+    const auto directory =
+        std::filesystem::u8path(plat::data_root()) / "p5r";
+    const auto plugin_trace_path = directory / "skyline_plugin_trace.txt";
+    const auto per_hit_path = directory / "skyline_per_hit_logs.txt";
+
+    std::error_code ec;
+    g_skyline_plugin_trace_enabled =
+        std::filesystem::is_regular_file(plugin_trace_path, ec) && !ec;
+    ec.clear();
+    g_skyline_per_hit_logs_enabled =
+        std::filesystem::is_regular_file(per_hit_path, ec) && !ec;
+
+    for (const char* filename : {
+             "skyline_inline_override.txt", "skyline_poke.txt",
+             "skyline_plugin_trace.txt", "skyline_per_hit_logs.txt"}) {
+        ec.clear();
+        const auto path = directory / filename;
+        if (std::filesystem::is_regular_file(path, ec) && !ec)
+            log("WARNING: skyline debug file active: %s",
+                path.string().c_str());
+    }
+
+    log("skyline: debug settings plugin-trace=%s per-hit-logs=%s",
+        g_skyline_plugin_trace_enabled ? "on" : "off",
+        g_skyline_per_hit_logs_enabled ? "on" : "off");
+}
 
 static bool skyline_hook_log_due(uint64_t& total) {
     ++total;
-    return total <= 20 || total % 10000 == 0;
+    return g_skyline_per_hit_logs_enabled &&
+        (total <= 20 || total % 10000 == 0);
 }
 
 static const char* skyline_hook_mode_name() {
@@ -763,7 +794,8 @@ static void skyline_memcpy(CPU& c) {
     const uint64_t requested_size = c.x[2];
     const uint64_t caller = c.x[30];
     const uint64_t event = ++g_skyline_memcpy_log_count;
-    const bool emit = event <= 200 || event % 1000 == 0;
+    const bool emit = g_skyline_per_hit_logs_enabled &&
+                      (event <= 200 || event % 1000 == 0);
 
     auto reject = [&](const char* reason) {
         c.x[0] = 1;
@@ -1059,6 +1091,9 @@ static void skyline_memcpy(CPU& c) {
 
 
 static void skyline_tcp_send_raw(CPU& c) {
+    if (!g_skyline_plugin_trace_enabled)
+        return;
+
     static uint64_t sequence = 0;
     const uint64_t address = c.x[0];
     const uint64_t requested_length = c.x[1];
@@ -1142,14 +1177,15 @@ static void skyline_a64_hook_function(CPU& c) {
         " replacement=" + skyline_module_address(replacement));
 
     skyline_log_hook_target("A64HookFunction", target);
-    log("skyline: hook-register api=A64HookFunction owner=%s caller=%llx "
-        "target=%s replacement=%s",
-        caller_owner.c_str(), (unsigned long long)caller,
-        describe(target).c_str(),
-        skyline_plugin_address_label(replacement).c_str());
+    if (g_skyline_per_hit_logs_enabled)
+        log("skyline: hook-register api=A64HookFunction owner=%s caller=%llx "
+            "target=%s replacement=%s",
+            caller_owner.c_str(), (unsigned long long)caller,
+            describe(target).c_str(),
+            skyline_plugin_address_label(replacement).c_str());
 
     ++g_skyline_function_hook_log_count;
-    const bool emit = true;
+    const bool emit = g_skyline_per_hit_logs_enabled;
     const uint64_t event = g_skyline_function_hook_log_count;
 
     if ((result_slot & 7) != 0 ||
@@ -1454,7 +1490,7 @@ static void skyline_inline_hook_callback(CPU& c) {
     const uint64_t trace_addresses[3] = {
         inline_context->x[19], inline_context->x[0], inline_context->x[1]
     };
-    if (invocation <= 3) {
+    if (g_skyline_plugin_trace_enabled && invocation <= 3) {
         PluginTraceScope trace("BL", trace_target, invocation);
         skyline_log_inline_ctx_raw("BL", trace_target, invocation,
             "before", *inline_context);
@@ -1472,7 +1508,7 @@ static void skyline_inline_hook_callback(CPU& c) {
         call(c, replacement);
     }
 
-    if (invocation <= 50)
+    if (g_skyline_plugin_trace_enabled && invocation <= 50)
         skyline_log_inline_ctx_diff(
             "BL", trace_target,
             invocation, before_x, original_sp, before_v, *inline_context);
@@ -2244,7 +2280,8 @@ static void skyline_trace_probe(CPU& c) {
 
 static void skyline_install_bonus_trace_probes(
     const LoadedModule& module, const std::string& plugin_name) {
-    if (plugin_name != "libp5r_bdsm.nro")
+    if (!g_skyline_plugin_trace_enabled ||
+        plugin_name != "libp5r_bdsm.nro")
         return;
 
     // Dump the loaded Bonus callback instructions before installing probes.
@@ -2425,6 +2462,7 @@ static void skyline_generic_inline_hook_callback(CPU& c) {
     SkylinePluginRuntime* callback_plugin =
         skyline_plugin_from_address(replacement);
     const bool trace_bonus_callback =
+        g_skyline_plugin_trace_enabled &&
         g_main &&
         hook->target == g_main->base + 0xcc2d1c &&
         callback_plugin &&
@@ -2447,11 +2485,12 @@ static void skyline_generic_inline_hook_callback(CPU& c) {
             (unsigned long long)context->x[1]);
 
     auto invoke_replacement = [&]() {
-        if (invocation <= 3)
+        if (g_skyline_plugin_trace_enabled && invocation <= 3)
             skyline_log_inline_ctx_raw("generic", hook->target, invocation,
                 "before", *context);
 
-        if (trace_bonus_callback || invocation <= 3) {
+        if (g_skyline_plugin_trace_enabled &&
+            (trace_bonus_callback || invocation <= 3)) {
             skyline_log_inline_memory("generic", hook->target, invocation,
                 "before", trace_addresses);
             if (trace_bonus_callback)
@@ -2461,11 +2500,12 @@ static void skyline_generic_inline_hook_callback(CPU& c) {
 
         call(c, replacement);
 
-        if (invocation <= 3)
+        if (g_skyline_plugin_trace_enabled && invocation <= 3)
             skyline_log_inline_ctx_raw("generic", hook->target, invocation,
                 "after", *context);
 
-        if (trace_bonus_callback || invocation <= 3) {
+        if (g_skyline_plugin_trace_enabled &&
+            (trace_bonus_callback || invocation <= 3)) {
             const uint64_t after_addresses[3] = {
                 context->x[19], context->x[0], context->x[1]
             };
@@ -2481,7 +2521,8 @@ static void skyline_generic_inline_hook_callback(CPU& c) {
         g_skyline_active_inline_ctx_address;
     g_skyline_active_inline_ctx_address = context_address;
 
-    if (trace_bonus_callback || invocation <= 3) {
+    if (g_skyline_plugin_trace_enabled &&
+        (trace_bonus_callback || invocation <= 3)) {
         PluginTraceScope trace("generic", hook->target, invocation);
         invoke_replacement();
     } else {
@@ -2504,7 +2545,7 @@ static void skyline_generic_inline_hook_callback(CPU& c) {
             (unsigned long long)context->x[0],
             (unsigned long long)context->x[1]);
 
-    if (invocation <= 50)
+    if (g_skyline_plugin_trace_enabled && invocation <= 50)
         skyline_log_inline_ctx_diff(
             "generic", hook->target, invocation,
             before_x, original_sp, before_v, *context);
@@ -2564,7 +2605,8 @@ static void skyline_a64_inline_hook(CPU& c) {
     const uint64_t caller = c.x[30];
     const std::string caller_owner = skyline_plugin_address_label(caller, true);
 
-    if (g_main && target == g_main->base + 0xcc2d1c)
+    if (g_skyline_plugin_trace_enabled &&
+        g_main && target == g_main->base + 0xcc2d1c)
         skyline_dump_cc2d1c_instructions(target);
 
     skyline_record_option(caller, true,
@@ -2573,14 +2615,15 @@ static void skyline_a64_inline_hook(CPU& c) {
         " replacement=" + skyline_module_address(replacement));
 
     skyline_log_hook_target("A64InlineHook", target);
-    log("skyline: hook-register api=A64InlineHook owner=%s caller=%llx "
-        "target=%s replacement=%s",
-        caller_owner.c_str(), (unsigned long long)caller,
-        describe(target).c_str(),
-        skyline_plugin_address_label(replacement).c_str());
+    if (g_skyline_per_hit_logs_enabled)
+        log("skyline: hook-register api=A64InlineHook owner=%s caller=%llx "
+            "target=%s replacement=%s",
+            caller_owner.c_str(), (unsigned long long)caller,
+            describe(target).c_str(),
+            skyline_plugin_address_label(replacement).c_str());
 
     ++g_skyline_inline_hook_log_count;
-    const bool emit = true;
+    const bool emit = g_skyline_per_hit_logs_enabled;
     const uint64_t event = g_skyline_inline_hook_log_count;
 
     if (g_skyline_hook_mode == SkylineHookMode::Off) {
@@ -3585,7 +3628,7 @@ static void skyline_trace_generate_random_bytes(CPU& c) {
 }
 
 static void skyline_install_random_trace() {
-    if (g_random_bytes_original)
+    if (!g_skyline_plugin_trace_enabled || g_random_bytes_original)
         return;
 
     static constexpr const char* kRandomSymbol =
@@ -3682,16 +3725,8 @@ void boot() {
     kernel_init();
     init_random_entropy();
 
-    const auto debug_dir = std::filesystem::u8path(plat::data_root()) / "p5r";
-    for (const char* filename : {
-             "skyline_inline_override.txt", "skyline_poke.txt"}) {
-        const auto path = debug_dir / filename;
-        std::error_code ec;
-        if (std::filesystem::exists(path, ec) && !ec)
-            log("WARNING: skyline debug file active: %s", path.string().c_str());
-    }
-
 #if NX_NCE
+    skyline_load_debug_settings();
     // P5R 1.0.2 test: only execute modules from the explicitly selected game image.
     // Never fall back to a separately extracted ExeFS directory.
     nce::init();

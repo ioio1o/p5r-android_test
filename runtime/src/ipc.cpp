@@ -148,8 +148,22 @@ uint32_t ipc_request(CPU& c, uint32_t handle, uint64_t buf, uint64_t) {
                 total += buffer.size;
             return total;
         };
+        auto buffer_sizes = [](const std::vector<Buffer>& buffers) {
+            std::string result;
+            for (const auto& buffer : buffers) {
+                if (!result.empty()) result += ',';
+                result += std::to_string(buffer.size);
+            }
+            return result.empty() ? std::string("-") : result;
+        };
+        const std::string a_sizes = buffer_sizes(ctx.a);
+        const std::string b_sizes = buffer_sizes(ctx.b);
+        const std::string w_sizes = buffer_sizes(wbufs);
+        const std::string x_sizes = buffer_sizes(ctx.x);
+        const std::string c_sizes = buffer_sizes(ctx.c);
         log("aoc:u cmd=%u protocol=%s in=%zu "
             "buffers[A=%zu/%llu B=%zu/%llu W=%zu/%llu X=%zu/%llu C=%zu/%llu] "
+            "sizes[A=%s B=%s W=%s X=%s C=%s] "
             "handles[in_copy=%zu in_move=%zu in_objects=%zu in_services=%zu "
             "out_copy=%zu out_move=%zu out_objects=%zu] "
             "out=%zu result=0x%08x",
@@ -159,6 +173,8 @@ uint32_t ipc_request(CPU& c, uint32_t handle, uint64_t buf, uint64_t) {
             wbufs.size(), (unsigned long long)total_size(wbufs),
             ctx.x.size(), (unsigned long long)total_size(ctx.x),
             ctx.c.size(), (unsigned long long)total_size(ctx.c),
+            a_sizes.c_str(), b_sizes.c_str(), w_sizes.c_str(),
+            x_sizes.c_str(), c_sizes.c_str(),
             ctx.in_copy.size(), ctx.in_move.size(),
             ctx.in_objects.size(), ctx.in_services.size(),
             ctx.out_copy.size(), ctx.out_move.size(),

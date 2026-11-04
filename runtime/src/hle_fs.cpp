@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_WIN32)
@@ -211,6 +212,22 @@ constexpr uint32_t kOk = 0;
 constexpr uint32_t kPathNotFound = 0x202;       // fs 1
 constexpr uint32_t kPathAlreadyExists = 0x402;  // fs 2
 constexpr uint32_t kTargetNotFound = 0x2EE202;  // fs 6001-ish: generic "not mounted"
+
+// Emit only the first miss for each guest path.
+std::mutex g_not_found_lock;
+std::unordered_set<std::string> g_not_found_paths;
+
+void log_not_found(const char* operation, const std::string& path,
+                   const char* reason) {
+    bool first = false;
+    {
+        std::lock_guard lk(g_not_found_lock);
+        first = g_not_found_paths.insert(path).second;
+    }
+    if (first)
+        log("fs: not found path=%s operation=%s reason=%s",
+            path.empty() ? "<empty>" : path.c_str(), operation, reason);
+}
 
 std::mutex g_fs;
 std::map<std::string, fs::path> g_mounts;
@@ -533,11 +550,16 @@ void GetEntryType(CPU& c) {  // (DirectoryEntryType* out, path)
         const nxi::GameImage::Entry* e = game_image()->find(rel);
         if (e) st<uint32_t>(c.x[0], e->dir ? 0 : 1);
         else if (mod_has_dir(rel)) st<uint32_t>(c.x[0], 0), e = &kModDir;
+        if (!e)
+            log_not_found("GetEntryType", trace.path,
+                          "absent from game RomFS and mod overlays");
         c.x[0] = e ? kOk : kPathNotFound;
         return;
     }
     std::error_code ec;
     if (p.empty() || !fs::exists(p, ec)) {
+        log_not_found("GetEntryType", trace.path,
+                      p.empty() ? "unknown mount" : "host path absent");
         c.x[0] = kPathNotFound;
         return;
     }
@@ -586,7 +608,8 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
         const nxi::GameImage::Entry* e = game_image()->find(rel);
         if (!e || e->dir) {
             note_open("OpenFile", guest, "not in the game file");
-            if (trace_fs()) log("fs: OpenFile(%s) not found in the game file", guest.c_str());
+            log_not_found("OpenFile", guest,
+                          "absent from game RomFS and mod overlays");
             c.x[0] = kPathNotFound;
             return;
         }
@@ -602,14 +625,15 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
     std::error_code ec;
     if (p.empty() || !fs::is_regular_file(p, ec)) {
         note_open("OpenFile", guest, p.empty() ? "unknown mount" : "not found");
-        if (trace_fs()) log("fs: OpenFile(%s) not found", guest.c_str());
+        log_not_found("OpenFile", guest,
+                      p.empty() ? "unknown mount" : "host file absent");
         c.x[0] = kPathNotFound;
         return;
     }
     FILE* f = plat::fopen_utf8(utf8(p), (mode & 2) ? "r+b" : "rb");
     if (!f) {
         note_open("OpenFile", guest, "the host could not open it");
-        if (trace_fs()) log("fs: OpenFile(%s) failed to open on the host (errno %d)", guest.c_str(), errno);
+        log_not_found("OpenFile", guest, "host open failed");
         c.x[0] = kPathNotFound;
         return;
     }
@@ -773,6 +797,8 @@ void OpenDirectory(CPU& c) {  // (DirectoryHandle* out, path, int mode: 1 dirs, 
         bool in_game = e && e->dir, in_mod = mod_has_dir(rel);
         note_open("OpenDirectory", cstr(c.x[1]), in_game || in_mod ? "ok (game file)" : "not in the game file");
         if (!in_game && !in_mod) {
+            log_not_found("OpenDirectory", guest,
+                          "absent from game RomFS and mod overlays");
             c.x[0] = kPathNotFound;
             return;
         }
@@ -814,8 +840,10 @@ void OpenDirectory(CPU& c) {  // (DirectoryHandle* out, path, int mode: 1 dirs, 
     std::error_code ec;
     bool found = !p.empty() && fs::is_directory(p, ec);
     note_open("OpenDirectory", cstr(c.x[1]), found ? "ok" : "not found");
-    if (trace_fs() || cstr(c.x[1]).rfind("sd:", 0) == 0) log("fs: OpenDirectory(%s, %d)%s", cstr(c.x[1]).c_str(), mode, found ? "" : " not found");
+    if (found && (trace_fs() || cstr(c.x[1]).rfind("sd:", 0) == 0)) log("fs: OpenDirectory(%s, %d)", cstr(c.x[1]).c_str(), mode);
     if (!found) {
+        log_not_found("OpenDirectory", guest,
+                      p.empty() ? "unknown mount" : "host directory absent");
         c.x[0] = kPathNotFound;
         return;
     }
