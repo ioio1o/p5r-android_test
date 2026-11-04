@@ -57,6 +57,11 @@ bool native_r11g11b10() {
     if (s >= 0) return s == 1;
 #if defined(__ANDROID__)
     if (!vk_physical()) return false;  // asked before the device exists: not decided yet
+    if (is_mali()) {
+        log("nvn/vk: Mali GPU detected: R11G11B10F kept as RGBA16F");
+        state.store(0, std::memory_order_release);
+        return false;
+    }
     const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
                                       VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
                                       VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
