@@ -1,6 +1,9 @@
 // Kernel objects shared by kernel.cpp and ipc.cpp.
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 #include <atomic>
 #include <condition_variable>
 #include <memory>
@@ -70,6 +73,7 @@ uint64_t heap_size();  // svcSetHeapSize's current size
 
 // svc_process.cpp
 void init_random_entropy();
+bool generate_random_bytes(uint8_t* bytes, size_t size);
 uint64_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint32_t& rc);
 uint32_t set_thread_core_mask(uint32_t handle, int32_t ideal, uint64_t mask);
 uint32_t map_transfer_memory(uint32_t handle, uint64_t addr, uint64_t size);

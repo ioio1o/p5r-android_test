@@ -2,6 +2,9 @@
 // mappings, and the initial static TLS every thread starts with. kernel.cpp dispatches to these.
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -22,6 +25,131 @@ namespace nx {
 namespace {
 uint64_t g_random_entropy[4]{};
 bool g_random_entropy_initialized = false;
+
+enum class EntropySource {
+    GetRandom,
+    Urandom,
+    RandomDevice,
+    ClockAddressMix
+};
+
+const char* entropy_source_name(EntropySource source) {
+    switch (source) {
+        case EntropySource::GetRandom: return "getrandom";
+        case EntropySource::Urandom: return "/dev/urandom";
+        case EntropySource::RandomDevice: return "random_device";
+        default: return "clock+address-mix";
+    }
+}
+
+uint64_t splitmix64(uint64_t& state) {
+    uint64_t z = (state += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+void clock_address_entropy(uint8_t* bytes, size_t size) {
+    uint64_t stack_address = reinterpret_cast<uintptr_t>(&stack_address);
+    uint64_t buffer_address = reinterpret_cast<uintptr_t>(bytes);
+    uint64_t state =
+        static_cast<uint64_t>(
+            std::chrono::system_clock::now().time_since_epoch().count()) ^
+        (static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count()) << 1) ^
+        buffer_address ^ (stack_address << 7);
+
+#if defined(__linux__)
+    state ^= static_cast<uint64_t>(::getpid()) << 32;
+#endif
+
+    size_t offset = 0;
+    while (offset < size) {
+        const uint64_t value = splitmix64(state);
+        const size_t count = std::min(sizeof(value), size - offset);
+        std::memcpy(bytes + offset, &value, count);
+        offset += count;
+    }
+}
+
+bool acquire_entropy(uint8_t* bytes, size_t size, EntropySource& source) {
+    if (!bytes && size)
+        return false;
+    if (!size) {
+        source = EntropySource::GetRandom;
+        return true;
+    }
+
+#if defined(__linux__)
+    size_t filled = 0;
+    while (filled < size) {
+        const long result = ::syscall(
+            SYS_getrandom, bytes + filled, size - filled, 0);
+        if (result < 0 && errno == EINTR)
+            continue;
+        if (result <= 0)
+            break;
+        filled += static_cast<size_t>(result);
+    }
+    if (filled == size) {
+        source = EntropySource::GetRandom;
+        return true;
+    }
+
+    // Discard partial getrandom output and retry the complete request.
+    const int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        filled = 0;
+        while (filled < size) {
+            const ssize_t result =
+                ::read(fd, bytes + filled, size - filled);
+            if (result < 0 && errno == EINTR)
+                continue;
+            if (result <= 0)
+                break;
+            filled += static_cast<size_t>(result);
+        }
+        ::close(fd);
+        if (filled == size) {
+            source = EntropySource::Urandom;
+            return true;
+        }
+    }
+#else
+    try {
+        std::random_device random;
+        size_t filled = 0;
+        while (filled < size) {
+            const unsigned int value = random();
+            const size_t count = std::min(sizeof(value), size - filled);
+            std::memcpy(bytes + filled, &value, count);
+            filled += count;
+        }
+        source = EntropySource::RandomDevice;
+        return true;
+    } catch (...) {
+        // Use the last-resort mixer below.
+    }
+#endif
+
+    clock_address_entropy(bytes, size);
+    source = EntropySource::ClockAddressMix;
+    return true;
+}
+
+uint32_t entropy_hash(const uint8_t* bytes, size_t size) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+}
+
+bool generate_random_bytes(uint8_t* bytes, size_t size) {
+    EntropySource source{};
+    return acquire_entropy(bytes, size, source);
 }
 
 void init_random_entropy() {
@@ -29,52 +157,33 @@ void init_random_entropy() {
         return;
 
     uint8_t bytes[sizeof(g_random_entropy)]{};
-
-#if defined(__linux__)
-    size_t filled = 0;
-    bool getrandom_ok = true;
-    while (filled < sizeof(bytes)) {
-        const long result = ::syscall(
-            SYS_getrandom, bytes + filled, sizeof(bytes) - filled, 0);
-        if (result < 0 && errno == EINTR)
-            continue;
-        if (result <= 0) {
-            getrandom_ok = false;
-            break;
-        }
-        filled += static_cast<size_t>(result);
-    }
-
-    if (getrandom_ok) {
-        log("entropy source=getrandom ok");
-    } else {
-        const int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-        if (fd < 0)
-            fatal("entropy: getrandom failed and /dev/urandom could not be opened");
-
-        filled = 0;
-        while (filled < sizeof(bytes)) {
-            const ssize_t result =
-                ::read(fd, bytes + filled, sizeof(bytes) - filled);
-            if (result < 0 && errno == EINTR)
-                continue;
-            if (result <= 0) {
-                ::close(fd);
-                fatal("entropy: /dev/urandom read failed");
-            }
-            filled += static_cast<size_t>(result);
-        }
-        ::close(fd);
-        log("entropy source=/dev/urandom ok");
-    }
-#else
-    std::random_device source;
-    for (size_t i = 0; i < sizeof(bytes); ++i)
-        bytes[i] = static_cast<uint8_t>(source());
-    log("entropy source=random_device ok");
-#endif
+    EntropySource source{};
+    if (!acquire_entropy(bytes, sizeof(bytes), source))
+        fatal("entropy: could not generate process entropy");
 
     std::memcpy(g_random_entropy, bytes, sizeof(g_random_entropy));
+
+    // Keep all four RandomEntropy subtypes distinct.
+    for (size_t i = 0; i < 4; ++i) {
+        for (;;) {
+            bool duplicate = false;
+            for (size_t j = 0; j < i; ++j) {
+                if (g_random_entropy[i] == g_random_entropy[j]) {
+                    uint64_t state = g_random_entropy[i] ^
+                        (0xD1B54A32D192ED03ull * (i + 1));
+                    g_random_entropy[i] = splitmix64(state);
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate)
+                break;
+        }
+    }
+
+    log("entropy source=%s", entropy_source_name(source));
+    log("entropy-hash=%08x",
+        static_cast<unsigned>(entropy_hash(bytes, sizeof(bytes))));
     g_random_entropy_initialized = true;
 }
 
@@ -96,9 +205,10 @@ uint64_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint32_t& rc) {
         case 9: return 0;  // ResourceLimit handle
         case 10: return 0;  // IdleTickCount
         case 11:
-            return sub < 4
-                ? g_random_entropy[sub]
-                : (0x1234567890ABCDEFull ^ sub);  // RandomEntropy
+            if (sub < 4)
+                return g_random_entropy[sub];  // RandomEntropy
+            rc = 0xF001;
+            return 0;
         case 12: return kAddressSpaceBase;
         case 13: return kAddressSpaceSize;
         case 14: return kStackBase;

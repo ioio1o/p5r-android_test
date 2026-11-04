@@ -1,5 +1,6 @@
 // Small services that only need to answer "yes, fine": parental controls, add-on content, logging, power.
 #include <cstdlib>
+#include <cstdint>
 #include "ipc.h"
 
 namespace nx {
@@ -54,6 +55,30 @@ ServiceRegistrar r_aoc("aoc:u", [] {
             auto e = std::make_shared<KEvent>();
             e->state = std::make_shared<EventState>();
             c.out_copy.push_back(handle_add(e));
+            return 0u;
+        };
+    });
+});
+
+// Nintendo's csrng service: command 0, GenerateRandomBytes.
+ServiceRegistrar r_csrng("csrng", [] {
+    return make("csrng", [](Service& s) {
+        s.cmds[0] = [](IpcCtx& c) {
+            const Buffer output = c.out_buf(0);
+            constexpr uint64_t kMaxRandomRequest = 16ull * 1024 * 1024;
+
+            if (output.size > kMaxRandomRequest ||
+                (output.size != 0 && output.addr == 0))
+                return 0xE401u;
+
+            if (output.size == 0)
+                return 0u;
+
+            if (!generate_random_bytes(
+                    reinterpret_cast<uint8_t*>(output.addr),
+                    static_cast<size_t>(output.size)))
+                return 0xF001u;
+
             return 0u;
         };
     });
