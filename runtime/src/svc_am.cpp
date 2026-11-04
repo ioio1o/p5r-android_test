@@ -173,8 +173,13 @@ std::shared_ptr<Service> library_applet(uint32_t applet_id, uint32_t mode) {
                     uint64_t cancelled = 0x2;  // nothing chosen
                     std::memcpy(out.data(), &cancelled, 8);
                 }
+            } else if (st->id == 0x11) { // swkbd (SoftwareKeyboard)
+                // Swkbd output: u32 result (0 = Ok), followed by a 0x7D4-byte string buffer.
+                out.assign(0x7D8, 0);
+                log("am: swkbd applet (0x11) invoked; returning default OK output storage");
             } else {
-                log("am: library applet 0x%x is not emulated; answering with an empty output", st->id);
+                log("am: library applet 0x%x is not emulated; returning zeroed output storage", st->id);
+                out.assign(0x1000, 0);
             }
             st->out.push_back(make_storage(std::move(out)));
             st->out_ready->signaled = true;
@@ -217,9 +222,13 @@ std::shared_ptr<Service> library_applet_creator() {
             c.push_object(make_storage(std::vector<uint8_t>(n > 0 && n < (1 << 24) ? size_t(n) : 0, 0)));
             return 0u;
         };
-        s.cmds[11] = [](IpcCtx& c) {  // CreateTransferMemoryStorage(bool writable, s64 size, handle): not backed
-            log("am: CreateTransferMemoryStorage is not supported");
-            c.push_object(make_storage(std::vector<uint8_t>()));
+        s.cmds[11] = [](IpcCtx& c) { // CreateTransferMemoryStorage(bool writable, s64 size, handle)
+            const int64_t requested = c.arg<int64_t>(8);
+            const size_t capacity =
+                requested > 0 && requested < (1 << 24)
+                    ? static_cast<size_t>(requested) : 0x10000;
+            log("am: CreateTransferMemoryStorage(size 0x%zx; vector-backed)", capacity);
+            c.push_object(make_storage(std::vector<uint8_t>(capacity, 0)));
             return 0u;
         };
     });

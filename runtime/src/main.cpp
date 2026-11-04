@@ -544,6 +544,15 @@ static constexpr uint64_t kSkylinePluginBase = 0x4030000000ull;
 static constexpr uint64_t kSkylinePluginSlotSize = 0x10000000ull;
 static constexpr uint64_t kSkylinePluginSlotCount = 4;
 
+// These compatibility handlers emulate game SDK behavior, not general Skyline APIs.
+static bool skyline_game_hle(const char* name) {
+    if (!name)
+        return false;
+    return std::strncmp(name, "_ZN2nn3ngc", 10) == 0 ||
+        std::strcmp(name, "_ZN2nn2fs29QueryMountSystemDataCacheSizeEPmNS_3ncm12SystemDataIdE") == 0 ||
+        std::strcmp(name, "_ZN2nn2fs15MountSystemDataEPKcNS_3ncm12SystemDataIdEPvm") == 0;
+}
+
 static uint64_t skyline_module_symbol(const ModuleInfo* module,
                                       const char* name) {
     if (!module || !name || !*name)
@@ -3082,7 +3091,7 @@ static bool load_skyline_nro(const std::filesystem::path& path) {
         }
 
         // Then registered HLE handlers.
-        if (!target && name[0] && hle_lookup(name)) {
+        if (!target && name[0] && hle_lookup(name) && !skyline_game_hle(name)) {
             target = hle_address(name);
             source = kImportHle;
         }
