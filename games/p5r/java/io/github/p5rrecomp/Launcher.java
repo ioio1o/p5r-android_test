@@ -51,7 +51,8 @@ import java.util.Map;
  *   game text   the language of the game's texts and subtitles (language=auto, default: the device's, English when
  *               the game lacks it; or en-US, es, fr, de, it, ja, ko, zh-Hans, zh-Hant). The voices are the game's own
  *               option.
- *   resolution  720p (NX_HANDHELD=1, default) or 1080p (NX_HANDHELD=0)
+ *   resolution  360p, 480p, 720p (NX_HANDHELD=1; default 720p) or 1080p (NX_HANDHELD=0)
+ *   fullscreen  stretch off (default) or on (NX_STRETCH=1)
  *   interface   at 720p (NX_HUD_1080=0, default: faster) or, in 720p, drawn at 1080p (NX_HUD_1080=1: sharper text)
  *   graphics    low (default), medium or high: textures one mip smaller (NX_LOD_BIAS=1), half a mip, or the game's
  *               own. (A lower render resolution needs the engine's target sizes: games/p5r/PROGRESO.md.)
@@ -292,8 +293,14 @@ public class Launcher extends Activity {
                         "Italiano", "日本語", "한국어", "简体中文", "繁體中文"},
                 new String[] {"Automatic (device language)", "English", "Español", "Français", "Deutsch", "Italiano",
                         "日本語", "한국어", "简体中文", "繁體中文"}, 0));
-        options.add(new Option("NX_HANDHELD", "Resolución", "Resolution", new String[] {"1", "0"},
-                new String[] {"720p", "1080p"}, new String[] {"720p", "1080p"}, 0));
+        options.add(new Option("RESOLUTION", "Resolución", "Resolution",
+                new String[] {"360p", "480p", "720p", "1080p"},
+                new String[] {"360p", "480p", "720p", "1080p"},
+                new String[] {"360p", "480p", "720p", "1080p"}, 2));
+        options.add(new Option("NX_STRETCH", "Pantalla completa (estirar)", "Fullscreen (stretch)",
+                new String[] {"0", "1"},
+                new String[] {"Desactivada", "Activada"},
+                new String[] {"Off", "On"}, 0));
         options.add(new Option("NX_HUD_1080", "Interfaz", "Interface", new String[] {"0", "1"},
                 new String[] {"720p (más rápida)", "1080p (textos nítidos)"},
                 new String[] {"720p (faster)", "1080p (sharp text)"}, 0));
@@ -534,6 +541,17 @@ public class Launcher extends Activity {
                 ? t("Activado", "On") : t("Desactivado", "Off"));
         for (Option o : options) {
             String v = config.get(o.key);
+            if ("RESOLUTION".equals(o.key) && v == null) {
+                String r = config.get("resolution");
+                if ("640x360".equals(r) || "360p".equals(r)) v = "360p";
+                else if ("854x480".equals(r) || "480p".equals(r)) v = "480p";
+                else if ("1280x720".equals(r) || "720p".equals(r)) v = "720p";
+                else if ("1920x1080".equals(r) || "1080p".equals(r)) v = "1080p";
+                if (v == null) {
+                    String hh = config.get("NX_HANDHELD");
+                    v = "0".equals(hh) ? "1080p" : "720p";
+                }
+            }
             for (int k = 0; v != null && k < o.values.length; k++)
                 if (o.values[k].equals(v)) o.pick = k;
         }
@@ -718,10 +736,29 @@ public class Launcher extends Activity {
         if (!dataDir().isDirectory()) return;
         load();
         for (Option o : options) config.put(o.key, o.values[o.pick]);
-        // GRAPHICS is the launcher's own key: the preset's switches are written with it (and removed for "high").
-        // RENDER_SCALE (the old option), NX_RENDER_RES and NX_ANISO_MAX are dropped: P5R sizes its targets from the
-        // console mode, not from the reported resolution, and never asks for anisotropic filtering.
-        for (String k : new String[] {"RENDER_SCALE", "NX_RENDER_RES", "NX_ANISO_MAX", "NX_LOD_BIAS"}) config.remove(k);
+        final String res = config.get("RESOLUTION");
+        if ("360p".equals(res)) {
+            config.put("NX_HANDHELD", "1");
+            config.put("resolution", "640x360");
+            config.put("NX_RENDER_RES", "640x360");
+            config.put("NX_RES", "360p");
+        } else if ("480p".equals(res)) {
+            config.put("NX_HANDHELD", "1");
+            config.put("resolution", "854x480");
+            config.put("NX_RENDER_RES", "854x480");
+            config.put("NX_RES", "480p");
+        } else if ("1080p".equals(res)) {
+            config.put("NX_HANDHELD", "0");
+            config.put("resolution", "1920x1080");
+            config.put("NX_RENDER_RES", "1920x1080");
+            config.put("NX_RES", "1080p");
+        } else {
+            config.put("NX_HANDHELD", "1");
+            config.put("resolution", "1280x720");
+            config.put("NX_RENDER_RES", "1280x720");
+            config.put("NX_RES", "720p");
+        }
+        for (String k : new String[] {"RENDER_SCALE", "NX_ANISO_MAX", "NX_LOD_BIAS"}) config.remove(k);
         final String preset = config.get("GRAPHICS");
         if ("low".equals(preset)) config.put("NX_LOD_BIAS", "1");
         else if ("medium".equals(preset)) config.put("NX_LOD_BIAS", "0.5");
