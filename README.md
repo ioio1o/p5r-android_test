@@ -1,6 +1,6 @@
 # Persona 5 Royal for Android (native port)
 
-An Android app that runs **your own copy** of Persona 5 Royal (Nintendo Switch, version 1.0.0) natively on an arm64
+An Android app that runs **your own copy** of Persona 5 Royal (Nintendo Switch, version 1.0.2) natively on an arm64
 phone or tablet. The Switch's operating system services, its audio, video and input, and NVN (the Switch's graphics
 API) are reimplemented on Android, with Vulkan for the graphics. The game's own code runs directly on the phone's CPU:
 the Switch and Android phones share the same CPU architecture (AArch64).
@@ -19,7 +19,7 @@ SEGA or Nintendo.
 
 ## Install
 
-1. Copy your **Persona 5 Royal 1.0.0** `.nsp` (or `.xci`) and your `prod.keys` to the phone (the Download folder is
+1. Copy your **Persona 5 Royal 1.0.2** `.nsp` (or `.xci`) and your `prod.keys` to the phone (the Download folder is
    fine). The base game only: not the update.
 2. Install **P5R** from the [Releases](../../releases) page (allow installing apps from your browser or file manager
    when Android asks).
