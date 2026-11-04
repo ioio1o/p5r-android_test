@@ -209,9 +209,9 @@ bool bc_host_decode(uint32_t nvn_format) {
     if (force) return true;
     if (!vk_features().textureCompressionBC) return true;
     VkFormat vk = vk_format(nvn_format);
-    if (vk != VK_FORMAT_UNDEFINED && vk_physical() && p_vkGetPhysicalDeviceFormatProperties) {
+    if (vk != VK_FORMAT_UNDEFINED && vk_physical() && vk::p_vkGetPhysicalDeviceFormatProperties) {
         VkFormatProperties fp{};
-        p_vkGetPhysicalDeviceFormatProperties(vk_physical(), vk, &fp);
+        vk::p_vkGetPhysicalDeviceFormatProperties(vk_physical(), vk, &fp);
         if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) return true;
     }
     return false;
