@@ -140,6 +140,17 @@ No borres ni muevas el archivo del juego: cada vez que juegas se lee de ahí. Pu
 imagen** puedes crear un acceso directo con la imagen que quieras. No se proporcionan juegos ni claves.
 
 ## Credits and license
+This project is based on [Brandon04Gonzalez/p5r-android](https://github.com/Brandon04Gonzalez/p5r-android).
+
+The Android NCE and Skyline integration builds upon the original
+project's work. Upstream changes are adapted to preserve the Android
+port and its platform-specific functionality.
+
+Upstream contributors retain credit for their original contributions.
+See the original repository's contributors and commit history.
+
+- Original project: https://github.com/Brandon04Gonzalez/p5r-android
+- Integration branch: https://github.com/ioio1o/p5r-android_test/tree/integration/skyline-android
 
 - Runtime: [SwitchGamesRecomp / Super Mario Bros. Wonder Recomp](https://github.com/BelmanteGu/SuperMarioWonderRecomp)
   by BelmanteGu (Projeto Belmante), MIT.
