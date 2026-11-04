@@ -492,6 +492,7 @@ static void skyline_report_option_diff(
 
 static bool skyline_plugin_allowed(const std::string& filename) {
     static bool loaded = false;
+    static bool restricted = false;
     static std::vector<std::string> allowed;
 
     if (!loaded) {
@@ -518,15 +519,18 @@ static bool skyline_plugin_allowed(const std::string& filename) {
             allowed.push_back(line);
         }
 
-        if (allowed.empty())
-            allowed.push_back("libcbt.nro");
+        restricted = !allowed.empty();
 
-        log("skyline: plugin allowlist loaded: %zu filename(s)",
-            allowed.size());
+        if (restricted) {
+            log("skyline: plugin allowlist loaded: %zu filename(s)",
+                allowed.size());
+        } else {
+            log("skyline: plugin allowlist disabled (missing or empty)");
+        }
     }
 
-    return std::find(allowed.begin(), allowed.end(), filename)
-        != allowed.end();
+    return !restricted ||
+        std::find(allowed.begin(), allowed.end(), filename) != allowed.end();
 }
 
 static uint64_t g_skyline_next_slot = 0;
