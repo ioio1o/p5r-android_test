@@ -237,7 +237,7 @@ static void skyline_load_hook_mode() {
 
 static bool skyline_plugin_phase_before_ctors() {
     static bool loaded = false;
-    static bool before_ctors = false;
+    static bool before_ctors = true;
 
     if (!loaded) {
         loaded = true;
@@ -247,8 +247,12 @@ static bool skyline_plugin_phase_before_ctors() {
 
         std::ifstream file(path);
         std::string value;
-        if (file >> value)
-            before_ctors = value == "before_ctors";
+        if (file >> value) {
+            if (value == "after_ctors")
+                before_ctors = false;
+            else if (value == "before_ctors")
+                before_ctors = true;
+        }
 
         log("skyline: plugin phase=%s config=%s",
             before_ctors ? "before_ctors" : "after_ctors",
