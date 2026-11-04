@@ -88,6 +88,8 @@ ServiceRegistrar r_csrng("csrng", [] {
     });
 });
 
+// Adapted from upstream:
+// Brandon04Gonzalez/p5r-android@c5353d7e76d39af4907d005c27d98d0788cff837
 ServiceRegistrar r_ngc("ngc:u", [] {
     return make("ngc:u", [](Service& s) {
         s.cmds[0] = [](IpcCtx& c) { c.push<uint32_t>(1); return 0u; };  // GetContentVersion
@@ -330,8 +332,6 @@ NX_HLE("_ZN2nn3ngc15ProfanityFilter24MaskProfanityWordsInTextEPiPjPKDsmj", NgcMa
 NX_HLE("_ZN2nn3ngc12CountNumbersEPKc", NgcCountNumbers);
 NX_HLE("_ZN2nn3ngc12CountNumbersEPKt", NgcCountNumbers);
 NX_HLE("_ZN2nn3ngc12CountNumbersEPKDs", NgcCountNumbers);
-
-}  // namespace
 
 }  // namespace
 
