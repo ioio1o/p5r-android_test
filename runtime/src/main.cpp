@@ -163,7 +163,7 @@ enum class SkylineHookMode {
 };
 
 static SkylineHookMode g_skyline_hook_mode =
-    SkylineHookMode::Passthrough;
+    SkylineHookMode::Full;
 static bool g_skyline_hook_mode_loaded = false;
 static bool g_skyline_plugin_trace_enabled = false;
 static bool g_skyline_per_hit_logs_enabled = false;
@@ -208,7 +208,7 @@ static const char* skyline_hook_mode_name() {
         case SkylineHookMode::Passthrough: return "passthrough";
         case SkylineHookMode::Full: return "full";
     }
-    return "passthrough";
+    return "full";
 }
 
 static void skyline_load_hook_mode() {
