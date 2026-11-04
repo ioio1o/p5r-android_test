@@ -11,7 +11,7 @@ prepare the game once (a few minutes), and play. The game is read from your file
 > [!IMPORTANT]
 > **No game files are included, here or in the APK.** This repository and its releases hold no game code, assets,
 > shaders, keys or firmware. The APK is only the engine: it reads the game from your own dump. You need your own
-> legally dumped copy of the game (the base game, version 1.0.0) and your own `prod.keys`. How to dump them from your
+> legally dumped copy of the game (version 1.0.2) and your own `prod.keys`. How to dump them from your
 > console is **not** covered here. Please do not ask for game files or keys.
 
 Persona 5 Royal is © ATLUS / © SEGA. This is an unofficial fan project, not affiliated with or endorsed by ATLUS,
@@ -47,7 +47,7 @@ change its own icon in the app drawer, but the shortcut looks and works like one
 - An arm64 Android phone or tablet with **Android 10 or newer** and **Vulkan 1.1**, 6 GB of RAM or more (8 GB
   recommended).
 - Storage: the game file (about 15 GB) plus about 1 GB for the translated shaders and saves.
-- Your own dump of **Persona 5 Royal 1.0.0** (title ID `01005CA01580E000`, build ID `708BCACA873EA32B`) and your
+- Your own dump of **Persona 5 Royal 1.0.2** (title ID `01005CA01580E000`, build ID prefix D4B150B29A931CD3) and your
   console's `prod.keys`.
 
 ## Status
@@ -119,6 +119,20 @@ adb logcat -s p5r:V > p5r-log.txt
 ```
 (run it before starting the game). Never attach game files, keys, or screenshots of copyrighted content beyond what
 the report needs.
+
+## Skyline plugin support
+
+This port implements an Android-adapted Skyline plugin runtime,
+allowing compatible Nintendo Switch Skyline NRO plugins to run
+alongside the game.
+
+Plugins are discovered under:
+
+`Persona 5 Royal/sdmc/atmosphere/content/01005CA01580E000/romfs/skyline/plugins/`
+
+Compatibility depends on the plugin's dependencies and the Skyline
+APIs and game interfaces it uses. This is an ongoing compatibility
+implementation, not a claim of complete Skyline or emulator parity.
 
 ## En español
 
