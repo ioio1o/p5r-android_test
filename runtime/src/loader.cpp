@@ -43,6 +43,53 @@ std::unordered_map<std::string, HleFn>& registry() {
     return r;
 }
 
+static void get_default_user_exception_stack(CPU& c) {
+    constexpr uint64_t kExceptionStackSize = 0x10000;
+    static const uint64_t stack = kernel_alloc(kExceptionStackSize, 0x1000);
+
+    const uint64_t out = c.x[0];
+    if (out) {
+        const VmInfo info = vm_query(out);
+        const bool writable =
+            info.state != kMemFree &&
+            info.state != kMemInaccessible &&
+            (info.perm & 2) != 0 &&
+            out >= info.addr &&
+            out - info.addr <= info.size &&
+            sizeof(uint64_t) <= info.size - (out - info.addr);
+
+        if (writable) {
+            *reinterpret_cast<uint64_t*>(out) = kExceptionStackSize;
+        } else {
+            log("HLE exception stack: invalid or non-writable size output at %llx",
+                static_cast<unsigned long long>(out));
+        }
+    }
+
+    c.x[0] = stack;
+}
+
+static void set_user_exception_handler(CPU& c) {
+    c.x[0] = 0;
+}
+
+static void is_virtual_address_memory_enabled(CPU& c) {
+    log("HLE nn::os::IsVirtualAddressMemoryEnabled -> false");
+    c.x[0] = 0;
+}
+
+static HleRegistrar hle_exception_stack(
+    "nnosGetDefaultUserExceptionStackForApplication",
+    get_default_user_exception_stack);
+
+static HleRegistrar hle_set_exception_handler(
+    "_ZN2nn2os23SetUserExceptionHandlerEPFvPNS0_17UserExceptionInfoEEPvmS2_",
+    set_user_exception_handler);
+
+static HleRegistrar hle_vamm_enabled(
+    "_ZN2nn2os29IsVirtualAddressMemoryEnabledEv",
+    is_virtual_address_memory_enabled);
+
 thread_local const char* t_missing_name = nullptr;
 thread_local const char* t_plugin_trace_hook = nullptr;
 thread_local uint64_t t_plugin_trace_target = 0;
