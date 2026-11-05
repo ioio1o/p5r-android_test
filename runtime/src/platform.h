@@ -22,6 +22,7 @@ constexpr bool kDiagnostics = true;
 bool reserve(uint64_t addr, uint64_t size);  // exactly at addr, no access
 bool commit(uint64_t addr, uint64_t size);   // read/write
 void decommit(uint64_t addr, uint64_t size);
+bool release(uint64_t addr, uint64_t size);  // release an owned reservation
 
 // ---- threads and time ----
 using ThreadFn = void (*)(void*);

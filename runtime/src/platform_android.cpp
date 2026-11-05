@@ -90,6 +90,10 @@ void decommit(uint64_t addr, uint64_t size) {
     mprotect(reinterpret_cast<void*>(addr), size, PROT_NONE);
 }
 
+bool release(uint64_t addr, uint64_t size) {
+    return munmap(reinterpret_cast<void*>(addr), size) == 0;
+}
+
 // ---- threads and time -----------------------------------------------------------------------------------------
 
 struct ThreadStart {

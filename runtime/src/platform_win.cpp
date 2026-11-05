@@ -44,6 +44,10 @@ bool commit(uint64_t addr, uint64_t size) {
 
 void decommit(uint64_t addr, uint64_t size) { VirtualFree(reinterpret_cast<void*>(addr), size, MEM_DECOMMIT); }
 
+bool release(uint64_t addr, uint64_t) {
+    return VirtualFree(reinterpret_cast<void*>(addr), 0, MEM_RELEASE) != 0;
+}
+
 // ---- threads and time -----------------------------------------------------------------------------------------
 
 struct ThreadStart {
