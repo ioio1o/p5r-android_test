@@ -692,7 +692,7 @@ extern "C" void android_main(android_app* app) {
     // The picked folder wins over the app's own one; else the own one (adb push), else Internal storage/<title>.
     g_root = !chosen.empty() && has_data(chosen) ? chosen : has_data(own) ? own : shared;
     // config.txt's NX_* lines become environment variables (the NVN layer reads its switches with getenv).
-    // Preserve existing values except NX_STRETCH, which must follow the launcher's current setting.
+    // Preserve existing values except launcher-controlled settings, which must follow the current config.
     // Android defaults: handheld (720p, the lighter GPU load).
     {
         std::ifstream f(g_root + "/config.txt");
@@ -703,8 +703,9 @@ extern "C" void android_main(android_app* app) {
             if (line.rfind("NX_", 0) == 0 && eq != std::string::npos) {
                 const std::string key = line.substr(0, eq);
                 const std::string value = line.substr(eq + 1);
-                // Launcher and NativeActivity share a process: update stretch even if a previous launch set it to "1".
-                setenv(key.c_str(), value.c_str(), key == "NX_STRETCH" ? 1 : 0);
+                // Launcher and NativeActivity share a process: refresh both settings, including when switched off.
+                setenv(key.c_str(), value.c_str(),
+                       (key == "NX_STRETCH" || key == "NX_P5R_ASPECT_20_9") ? 1 : 0);
             }
         }
         // NX_HANDHELD=0 in config.txt (the launcher's TV mode): docked, 1080p. svc_am.cpp tests only whether the variable

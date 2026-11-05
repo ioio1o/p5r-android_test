@@ -301,6 +301,10 @@ public class Launcher extends Activity {
                 new String[] {"0", "1"},
                 new String[] {"Desactivada", "Activada"},
                 new String[] {"Off", "On"}, 0));
+        options.add(new Option("NX_P5R_ASPECT_20_9", "Relación de aspecto nativa (20:9)",
+                "Native aspect ratio (20:9)", new String[] {"0", "1"},
+                new String[] {"Desactivada", "Activada"},
+                new String[] {"Off", "On"}, 0));
         options.add(new Option("NX_HUD_1080", "Interfaz", "Interface", new String[] {"0", "1"},
                 new String[] {"720p (más rápida)", "1080p (textos nítidos)"},
                 new String[] {"720p (faster)", "1080p (sharp text)"}, 0));

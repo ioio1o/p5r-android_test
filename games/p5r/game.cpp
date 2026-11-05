@@ -18,6 +18,10 @@
 #include <nx/game.h>
 #include <nx/runtime.h>
 
+#if NX_NCE
+#include "nce/nce.h"
+#endif
+
 #include "platform.h"
 
 namespace nx {
@@ -86,6 +90,39 @@ void fputs_logged(CPU& c) {
 // NX_P5R_TRACE_INTERVAL=1: the setter's calls are logged.
 uint64_t g_interval_setter = 0;  // the original setter (call(c, it))
 uint64_t g_main_base = 0;
+
+#if NX_NCE
+// P5R 1.0.2: replace the 16:9 aspect constant passed to the engine's aspect setter.
+void apply_native_aspect_patch(const LoadedModule& main) {
+    constexpr uint64_t kOffset = 0xCE3CC8;
+    constexpr uint32_t kOriginal[2] = {0x5291C728u, 0x72A7FC68u};
+    constexpr uint32_t kTwentyNine[2] = {0x52871C88u, 0x72A801C8u};
+
+    if (!main.info || kOffset + sizeof(kOriginal) > main.info->text_size) {
+        log("p5r: native 20:9 patch skipped: aspect instructions are outside main text");
+        return;
+    }
+
+    const uint64_t address = main.base + kOffset;
+    const uint32_t found[2] = {ld<uint32_t>(address), ld<uint32_t>(address + 4)};
+    if (found[0] != kOriginal[0] || found[1] != kOriginal[1]) {
+        log("p5r: native 20:9 patch skipped: unexpected instructions at main+%llx "
+            "(%08x %08x; expected %08x %08x)",
+            (unsigned long long)kOffset, found[0], found[1], kOriginal[0], kOriginal[1]);
+        return;
+    }
+
+    bool used_rwx = false;
+    if (!nce::write_code_checked(address, kTwentyNine, sizeof(kTwentyNine), true, &used_rwx)) {
+        log("p5r: native 20:9 patch failed: could not write main+%llx",
+            (unsigned long long)kOffset);
+        return;
+    }
+
+    log("p5r: native 20:9 aspect patch applied at main+%llx (20:9, %s write)",
+        (unsigned long long)kOffset, used_rwx ? "RWX" : "RW fallback");
+}
+#endif
 constexpr double kTicks = 19.2e6;  // the system tick the engine times its frames with
 
 int target_fps() {
@@ -558,6 +595,11 @@ void game::after_init() {
     setenv("NX_HUD_KEEP_ALPHA", "1", 0);
 #endif
     const LoadedModule* m = module_at(find_symbol("nnMain"));
+#if NX_NCE
+    const char* aspect_20_9 = std::getenv("NX_P5R_ASPECT_20_9");
+    if (m && aspect_20_9 && aspect_20_9[0] == '1')
+        apply_native_aspect_patch(*m);
+#endif
     if (m && (g_interval_setter = hook_function(m->base + 0x1048ee0, interval_setter_hook))) {
         g_main_base = m->base;
         if (std::getenv("NX_P5R_CULL_CHECK") && !(g_cull_job = hook_function(m->base + 0xab0f50, cull_job_hook)))
