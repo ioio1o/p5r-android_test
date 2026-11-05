@@ -316,6 +316,16 @@ void WindowInitialize(CPU& c) {  // NVNboolean (NVNwindow*, const NVNwindowBuild
     if (w.active <= 0 || w.active > n) w.active = n;
     w.interval = int(driver(c, "nvnWindowBuilderGetPresentInterval", {builder}));
     log("nvn: window %llx: %d textures (%d active), present interval %d", (unsigned long long)guest, n, w.active, w.interval);
+    for (int k = 0; k < n; k++) {
+        uint64_t handle = w.textures[size_t(k)];
+        if (auto* t = get<Texture>(handle))
+            log("nvn: window texture %d/%d%s: %llx, %ux%u, format %u, flags %08x",
+                k, n, k < w.active ? " active" : "", (unsigned long long)handle,
+                t->width, t->height, t->format, t->flags);
+        else
+            log("nvn: window texture %d/%d%s: %llx, descriptor unavailable",
+                k, n, k < w.active ? " active" : "", (unsigned long long)handle);
+    }
     c.x[0] = 1;
 }
 
@@ -621,6 +631,18 @@ void QueuePresentTexture(CPU& c) {
         if (int(c.x[2]) >= 0 && size_t(c.x[2]) < w->textures.size()) {
             uint64_t texture = w->textures[size_t(c.x[2])];
             std::array<int32_t, 4> crop{w->crop[0], w->crop[1], w->crop[2], w->crop[3]};
+            static uint64_t diagnostic_presents = 0;
+            const uint64_t diagnostic_n = ++diagnostic_presents;
+            if (diagnostic_n == 1 || (diagnostic_n & (diagnostic_n - 1)) == 0) {
+                if (auto* t = get<Texture>(texture))
+                    log("nvn: present texture #%llu index %d: %llx, %ux%u, crop %d,%d %dx%d",
+                        (unsigned long long)diagnostic_n, int(c.x[2]), (unsigned long long)texture,
+                        t->width, t->height, crop[0], crop[1], crop[2], crop[3]);
+                else
+                    log("nvn: present texture #%llu index %d: %llx, descriptor unavailable, crop %d,%d %dx%d",
+                        (unsigned long long)diagnostic_n, int(c.x[2]), (unsigned long long)texture,
+                        crop[0], crop[1], crop[2], crop[3]);
+            }
             queued[next_slot] = worker_run([texture, crop, origin] { gpu_present(texture, crop.data(), origin); });
             next_slot ^= 1;
         }
